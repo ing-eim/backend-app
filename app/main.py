@@ -33,12 +33,20 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 # --- Endpoint para procesar archivo Excel ---
 @app.post("/procesar-excel/")
 async def procesar_excel(file: UploadFile = File(...)):
+    import os
     try:
         file_location = f"temp_{file.filename}"
         with open(file_location, "wb") as f:
             f.write(await file.read())
         data = process_excel(file_location)
-        return {"rows": data}
+        response = {"rows": data}
+        # Elimina el archivo temporal después de procesar y responder
+        try:
+            os.remove(file_location)
+        except Exception as del_err:
+            import logging
+            logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
+        return response
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 
