@@ -1,11 +1,12 @@
 
 import logging
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from app.database import SessionLocal, engine
 from app import models, schemas, crud, auth
+from app.excel_processor import process_excel
 from jose import JWTError, jwt
 
 logging.basicConfig(
@@ -18,6 +19,7 @@ models.Base.metadata.create_all(bind=engine)
 
 
 
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -27,6 +29,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+
+# --- Endpoint para procesar archivo Excel ---
+@app.post("/procesar-excel/")
+async def procesar_excel(file: UploadFile = File(...)):
+    try:
+        file_location = f"temp_{file.filename}"
+        with open(file_location, "wb") as f:
+            f.write(await file.read())
+        data = process_excel(file_location)
+        return {"rows": data}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 
 # Dependency
 def get_db():
