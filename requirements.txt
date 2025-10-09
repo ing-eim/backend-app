@@ -4,3 +4,10 @@ sqlalchemy
 pymysql
 python-jose
 passlib
+pyodbc
+'pydantic[email]'
+pandas
+python-multipart
+argon2_cffi
+python-multipart
+openpyxl

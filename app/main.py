@@ -23,7 +23,14 @@ models.Base.metadata.create_all(bind=engine)
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:4200"],  # Cambia por el origen de tu frontend
+    allow_origins=[
+        "http://localhost:4200",
+        "http://localhost:3000",
+        "http://127.0.0.1:4200",
+        "http://127.0.0.1:3000",
+        "http://dwh.retornologistico.com",
+        "https://http://dwh.retornologistico.com"
+    ],  # Agrega aquí los orígenes necesarios
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
