@@ -1,5 +1,5 @@
 
-from sqlalchemy import Column, Integer, String, Text, Boolean, TIMESTAMP, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Text, Boolean, TIMESTAMP, ForeignKey, UniqueConstraint, func
 from sqlalchemy.orm import relationship, declarative_base
 
 Base = declarative_base()
@@ -20,7 +20,7 @@ class Usuario(Base):
     contrasena_hash = Column(String(255), nullable=False)
     rol_id = Column(Integer, ForeignKey("roles.id"), nullable=True)
     activo = Column(Boolean, default=True)
-    fecha_creacion = Column(TIMESTAMP)
+    fecha_creacion = Column(TIMESTAMP, server_default=func.now())
     rol = relationship("Rol", back_populates="usuarios")
     bitacoras = relationship("Bitacora", back_populates="usuario")
     tokens = relationship("Token", back_populates="usuario")
@@ -40,7 +40,7 @@ class Token(Base):
     id = Column(Integer, primary_key=True)
     usuario_id = Column(Integer, ForeignKey("usuarios.id"), nullable=False)
     token = Column(Text, nullable=False)
-    fecha_creacion = Column(TIMESTAMP)
+    fecha_creacion = Column(TIMESTAMP, server_default=func.now())
     fecha_expiracion = Column(TIMESTAMP, nullable=True)
     activo = Column(Boolean, default=True)
     usuario = relationship("Usuario", back_populates="tokens")
@@ -50,7 +50,7 @@ class RecuperacionContrasena(Base):
     id = Column(Integer, primary_key=True)
     usuario_id = Column(Integer, ForeignKey("usuarios.id"), nullable=False)
     token = Column(Text, nullable=False)
-    fecha_solicitud = Column(TIMESTAMP)
+    fecha_solicitud = Column(TIMESTAMP, server_default=func.now())
     fecha_expiracion = Column(TIMESTAMP, nullable=True)
     usado = Column(Boolean, default=False)
     usuario = relationship("Usuario", back_populates="recuperaciones")

@@ -44,3 +44,13 @@ class BitacoraOut(BitacoraBase):
     fecha: Optional[str]
     class Config:
         orm_mode = True
+
+
+class CronActivDiariaOut(BaseModel):
+    actividad_descripcion: Optional[str]
+    archivo_nombre: Optional[str]
+    archivo_nomenclatura: Optional[str]
+    dias_carga: Optional[str]
+
+    class Config:
+        orm_mode = True

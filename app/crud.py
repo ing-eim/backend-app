@@ -28,7 +28,8 @@ def create_usuario(db: Session, usuario: schemas.UsuarioCreate):
     return db_usuario
 
 def get_usuarios(db: Session, skip: int = 0, limit: int = 100):
-    return db.query(models.Usuario).offset(skip).limit(limit).all()
+    # SQL Server requiere ORDER BY cuando se usa OFFSET/LIMIT
+    return db.query(models.Usuario).order_by(models.Usuario.id).offset(skip).limit(limit).all()
 
 def update_usuario(db: Session, usuario_id: int, usuario: schemas.UsuarioCreate):
     db_usuario = get_usuario(db, usuario_id)
@@ -80,3 +81,32 @@ def get_bitacora(db: Session, usuario_id: int = None):
     if usuario_id:
         query = query.filter(models.Bitacora.usuario_id == usuario_id)
     return query.all()
+
+# Tokens y recuperaciones
+def create_token(db: Session, usuario_id: int, token_str: str, fecha_expiracion=None):
+    db_token = models.Token(
+        usuario_id=usuario_id,
+        token=token_str,
+        fecha_expiracion=fecha_expiracion,
+        activo=True
+    )
+    db.add(db_token)
+    db.commit()
+    db.refresh(db_token)
+    return db_token
+
+def deactivate_tokens_for_user(db: Session, usuario_id: int):
+    db.query(models.Token).filter(models.Token.usuario_id == usuario_id, models.Token.activo == True).update({"activo": False})
+    db.commit()
+
+def create_recuperacion(db: Session, usuario_id: int, token_str: str, fecha_expiracion=None):
+    db_rec = models.RecuperacionContrasena(
+        usuario_id=usuario_id,
+        token=token_str,
+        fecha_expiracion=fecha_expiracion,
+        usado=False
+    )
+    db.add(db_rec)
+    db.commit()
+    db.refresh(db_rec)
+    return db_rec
