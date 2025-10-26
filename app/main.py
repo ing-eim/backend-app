@@ -8,7 +8,10 @@ from sqlalchemy import text
 from app.database import SessionLocal, engine
 from app import models, schemas, crud, auth
 from app.excel_processor import process_excel
+import json
+from fastapi.encoders import jsonable_encoder
 from jose import JWTError, jwt
+import re
 
 logging.basicConfig(
     filename="api.log",
@@ -57,20 +60,50 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 @app.post("/procesar-excel/")
 async def procesar_excel(file: UploadFile = File(...), current_user: models.Usuario = Depends(get_current_user)):
     import os
+    # Validar nomenclatura: OnTime_acumulado_AAAA (AAAA = año de 4 dígitos)
+    filename = file.filename or ""
+    name_only, _ext = os.path.splitext(filename)
+    m = re.match(r"^OnTime_acumulado_(\d{4})$", name_only)
+    if not m:
+        logging.warning(f"Archivo con nombre inválido recibido: {filename}")
+        raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'OnTime_acumulado_AAAA'")
+    year = int(m.group(1))
+    if year < 2000 or year > 2100:
+        logging.warning(f"Archivo con año inválido en el nombre: {filename}")
+        raise HTTPException(status_code=400, detail="El año en el nombre del archivo no es válido")
+
     try:
         file_location = f"temp_{file.filename}"
         with open(file_location, "wb") as f:
             f.write(await file.read())
+
         data = process_excel(file_location)
-        response = {"rows": data}
-        # Elimina el archivo temporal después de procesar y responder
+
+        # Guardar resultados leídos en archivo .txt: acumulado_<AAAA>.txt
+        out_filename = f"acumulado_{year}.txt"
+        try:
+            with open(out_filename, "w", encoding="utf-8") as out_f:
+                for row in data:
+                    safe_row = jsonable_encoder(row)
+                    out_f.write(json.dumps(safe_row, ensure_ascii=False) + "\n")
+        except Exception as wf_err:
+            logging.error(f"Error escribiendo archivo de salida {out_filename}: {wf_err}")
+            raise HTTPException(status_code=500, detail=f"Error al guardar el archivo de salida: {wf_err}")
+
+        rows_count = len(data)
+
+        # Elimina el archivo temporal después de procesar
         try:
             os.remove(file_location)
         except Exception as del_err:
-            import logging
             logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
-        return response
+
+        # Retornar sólo el número de registros leídos
+        return {"rows_read": rows_count}
+    except HTTPException:
+        raise
     except Exception as e:
+        logging.error(f"Error procesando archivo {file.filename}: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 
 # Dependency
