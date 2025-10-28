@@ -40,9 +40,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(lambda: SessionLocal())):
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     """Dependency to get current user from JWT token. Raises 401 if invalid."""
     try:
         payload = jwt.decode(token, auth.SECRET_KEY, algorithms=[auth.ALGORITHM])
@@ -107,12 +113,15 @@ async def procesar_excel(file: UploadFile = File(...), current_user: models.Usua
         raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 
 # Dependency
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+import traceback
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    # Log full stack trace for debugging and return a sanitized 500 response
+    tb = traceback.format_exc()
+    logging.error(f"Unhandled exception for request {request.url}: {tb}")
+    return Response(status_code=500, content="Internal Server Error")
 
 # --- Endpoints de autenticación ---
 @app.post("/token")

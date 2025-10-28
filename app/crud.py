@@ -1,5 +1,5 @@
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from app import models, schemas
 from passlib.context import CryptContext
 
@@ -7,10 +7,10 @@ pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
 # Usuarios
 def get_usuario(db: Session, usuario_id: int):
-    return db.query(models.Usuario).filter(models.Usuario.id == usuario_id).first()
+    return db.query(models.Usuario).options(joinedload(models.Usuario.rol)).filter(models.Usuario.id == usuario_id).first()
 
 def get_usuario_by_nombre(db: Session, nombre_usuario: str):
-    return db.query(models.Usuario).filter(models.Usuario.nombre_usuario == nombre_usuario).first()
+    return db.query(models.Usuario).options(joinedload(models.Usuario.rol)).filter(models.Usuario.nombre_usuario == nombre_usuario).first()
 
 def create_usuario(db: Session, usuario: schemas.UsuarioCreate):
     password = usuario.contrasena
@@ -29,7 +29,7 @@ def create_usuario(db: Session, usuario: schemas.UsuarioCreate):
 
 def get_usuarios(db: Session, skip: int = 0, limit: int = 100):
     # SQL Server requiere ORDER BY cuando se usa OFFSET/LIMIT
-    return db.query(models.Usuario).order_by(models.Usuario.id).offset(skip).limit(limit).all()
+    return db.query(models.Usuario).options(joinedload(models.Usuario.rol)).order_by(models.Usuario.id).offset(skip).limit(limit).all()
 
 def update_usuario(db: Session, usuario_id: int, usuario: schemas.UsuarioCreate):
     db_usuario = get_usuario(db, usuario_id)
