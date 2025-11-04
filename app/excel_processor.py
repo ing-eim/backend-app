@@ -1467,3 +1467,206 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
     except Exception as e:
         logging.error(f"Error procesando disponibilidad transporte {file_path}: {e}")
         raise
+
+
+def process_factoraje(file_path: str, db: object, username: Optional[str] = None, original_name: Optional[str] = None) -> int:
+    """Process factoraje files into dbo.factoraje_tmp.
+
+    - Reads the FIRST sheet of the workbook (sheet index 0)
+    - Expects headers on the first row. Omits rows whose first column is empty.
+    - Inserts rows (no commit) into dbo.factoraje_tmp following the exact column order described by the user.
+    - Calls dbo.sp_proc_ontime(:nombre_usuario, :name_file_procesado) after successful inserts if username and original_name provided.
+
+    Returns number of rows inserted (omitting empty-first-column rows).
+    """
+    logging.info(f"Procesando factoraje: {file_path}")
+    try:
+        # Read first sheet with header=0
+        try:
+            df = pd.read_excel(file_path, sheet_name=0, header=0)
+            logging.info("Reading factoraje first sheet with header=0")
+        except Exception as read_err:
+            logging.error(f"No se pudo leer la primera hoja: {read_err}")
+            raise
+
+        df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
+        df = df.where(pd.notnull(df), None)
+
+        # Omit rows where first column is empty
+        if df.shape[1] > 0:
+            first_col = df.columns[0]
+            before_count = len(df)
+            try:
+                non_empty_mask = df[first_col].notnull() & (df[first_col].astype(str).str.strip() != '')
+            except Exception:
+                non_empty_mask = df[first_col].notnull()
+            df = df[non_empty_mask]
+            after_count = len(df)
+            dropped = before_count - after_count
+            if dropped > 0:
+                logging.info(f"Factoraje: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+
+        records = df.to_dict(orient='records')
+        processed_count = len(records)
+
+        # expected headers (human readable) - normalized comparison
+        expected = ['Nombre', 'No Viaje', 'No Factura', 'Flete', 'Maniobras', 'Otros', 'Subtotal', 'IVA', 'ISR', 'Total', 'FECHA FACT', 'CLIENTE']
+
+        def nk_local(s: str) -> str:
+            if s is None:
+                return ''
+            ss = str(s).replace('\xa0', ' ')
+            ss = unicodedata.normalize('NFKD', ss)
+            ss = ''.join(c for c in ss if not unicodedata.combining(c))
+            return re.sub(r"\s+", " ", ss).strip().upper()
+
+        normalized_key_map = {nk_local(k): k for k in list(df.columns)}
+        normalized_expected = {nk_local(e): e for e in expected}
+
+        insert_sql = (
+            "INSERT INTO dbo.factoraje_tmp (Nombre, No_Viaje, No_Factura, Flete, Maniobras, Otros, Subtotal, IVA, ISR, Total, Fecha_Fact, Cliente, Usuario_Creacion) "
+            "VALUES (:Nombre, :No_Viaje, :No_Factura, :Flete, :Maniobras, :Otros, :Subtotal, :IVA, :ISR, :Total, :Fecha_Fact, :Cliente, :Usuario_Creacion)"
+        )
+
+        total_inserted = 0
+        for idx, rec in enumerate(records, start=1):
+            params = {
+                'Nombre': None, 'No_Viaje': None, 'No_Factura': None, 'Flete': None, 'Maniobras': None, 'Otros': None,
+                'Subtotal': None, 'IVA': None, 'ISR': None, 'Total': None, 'Fecha_Fact': None, 'Cliente': None, 'Usuario_Creacion': username
+            }
+
+            for norm_key, col in normalized_key_map.items():
+                if norm_key in normalized_expected:
+                    val = rec.get(col)
+                    # Normalize strings
+                    if isinstance(val, str):
+                        val = val.replace('\xa0', ' ').strip()
+                        if val == '':
+                            val = None
+
+                    # Dates
+                    if val is not None and norm_key == nk_local('FECHA FACT'):
+                        try:
+                            if hasattr(val, 'to_pydatetime'):
+                                val = val.to_pydatetime()
+                            elif isinstance(val, _dt):
+                                pass
+                            else:
+                                parsed = pd.to_datetime(val, errors='coerce', dayfirst=False)
+                                if pd.isna(parsed):
+                                    parsed = pd.to_datetime(val, errors='coerce', dayfirst=True)
+                                if not pd.isna(parsed):
+                                    val = parsed.to_pydatetime()
+                                else:
+                                    val = None
+                        except Exception:
+                            val = None
+
+                    # Numeric coercion for monetary fields
+                    if val is not None and norm_key in {nk_local('Flete'), nk_local('Maniobras'), nk_local('Otros'), nk_local('Subtotal'), nk_local('IVA'), nk_local('ISR'), nk_local('Total')}:
+                        try:
+                            s = re.sub(r"[^0-9.,\-]", "", str(val))
+                            if s == '':
+                                val = None
+                            else:
+                                if s.count(',') > 0 and s.count('.') == 0:
+                                    s = s.replace(',', '.')
+                                elif s.count(',') > 0 and s.count('.') > 0:
+                                    if s.rfind('.') > s.rfind(','):
+                                        s = s.replace(',', '')
+                                    else:
+                                        s = s.replace('.', '').replace(',', '.')
+                                d = Decimal(s)
+                                val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            try:
+                                val = float(str(val).replace(',', '.'))
+                            except Exception:
+                                val = None
+
+                    # Assign to params by normalized expected key
+                    if norm_key == nk_local('NOMBRE'):
+                        params['Nombre'] = val
+                    elif norm_key == nk_local('NO VIAJE'):
+                        params['No_Viaje'] = val
+                    elif norm_key == nk_local('NO FACTURA'):
+                        params['No_Factura'] = val
+                    elif norm_key == nk_local('FLETE'):
+                        params['Flete'] = val
+                    elif norm_key == nk_local('MANIOBRAS'):
+                        params['Maniobras'] = val
+                    elif norm_key == nk_local('OTROS'):
+                        params['Otros'] = val
+                    elif norm_key == nk_local('SUBTOTAL'):
+                        params['Subtotal'] = val
+                    elif norm_key == nk_local('IVA'):
+                        params['IVA'] = val
+                    elif norm_key == nk_local('ISR'):
+                        params['ISR'] = val
+                    elif norm_key == nk_local('TOTAL'):
+                        params['Total'] = val
+                    elif norm_key == nk_local('FECHA FACT'):
+                        params['Fecha_Fact'] = val
+                    elif norm_key == nk_local('CLIENTE'):
+                        params['Cliente'] = val
+
+            # Safety: convert ints to strings for textual columns where appropriate
+            for k in list(params.keys()):
+                v = params[k]
+                if isinstance(v, int) and k not in ('Flete', 'Maniobras', 'Otros', 'Subtotal', 'IVA', 'ISR', 'Total'):
+                    try:
+                        params[k] = str(v)
+                    except Exception:
+                        pass
+
+            # Log params
+            try:
+                def _serialize_val(v):
+                    if v is None:
+                        return None
+                    try:
+                        if isinstance(v, _dt):
+                            return v.isoformat()
+                    except Exception:
+                        pass
+                    try:
+                        if isinstance(v, Decimal):
+                            return str(v)
+                    except Exception:
+                        pass
+                    return v
+
+                loggable = {k: _serialize_val(v) for k, v in params.items()}
+                logging.info(f"Factoraje insert fila {idx}: {loggable}")
+            except Exception as log_ex:
+                logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
+
+            db.execute(text(insert_sql), params)
+            try:
+                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+            except Exception:
+                affected = None
+            try:
+                total_inserted += int(affected) if affected is not None else 0
+            except Exception:
+                pass
+
+        # After inserts, call post-processing SP if provided
+        if username and original_name:
+            processed_name = original_name
+            if processed_name.lower().startswith('temp_'):
+                processed_name = processed_name[5:]
+            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
+            logging.info(f"Ejecutando dbo.sp_proc_ontime para factoraje usuario={username}, archivo={processed_name}")
+            db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
+            try:
+                sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+            except Exception:
+                sp2_af = None
+            logging.info(f"dbo.sp_proc_ontime (factoraje) @@ROWCOUNT={sp2_af}")
+
+        logging.info(f"Factoraje: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        return processed_count
+    except Exception as e:
+        logging.error(f"Error procesando factoraje {file_path}: {e}")
+        raise
