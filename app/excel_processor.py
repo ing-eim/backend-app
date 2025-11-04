@@ -539,6 +539,28 @@ def process_incidencias(file_path: str, db: object, username: Optional[str] = No
                         pass
 
             # Execute insert
+            # Log the parameters being inserted (serialize datetimes/decimals) to help debugging
+            try:
+                def _serialize_val(v):
+                    if v is None:
+                        return None
+                    try:
+                        if isinstance(v, _dt):
+                            return v.isoformat()
+                    except Exception:
+                        pass
+                    try:
+                        if isinstance(v, Decimal):
+                            return str(v)
+                    except Exception:
+                        pass
+                    return v
+
+                loggable = {k: _serialize_val(v) for k, v in params.items()}
+                logging.info(f"PipelineComercial insert fila {idx}: {loggable}")
+            except Exception as log_ex:
+                logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
+
             db.execute(text(insert_sql), params)
             try:
                 affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
@@ -594,7 +616,53 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
         if sheet_to_use is None:
             raise ValueError("Hoja que contiene 'Data_Historico' no encontrada en el archivo Excel")
 
-        df = pd.read_excel(file_path, sheet_name=sheet_to_use)
+        # Attempt to auto-detect header row: prefer header=1 (so data starts on row 3),
+        # but fall back to header=0 when header=1 looks invalid (many empty or duplicate column names).
+        def _read_with_header_guess(path, sheet_name):
+            try:
+                df_try = pd.read_excel(path, sheet_name=sheet_name, header=1)
+                cols = list(df_try.columns)
+                # Clean header names to assess validity
+                cleaned = [None if c is None else str(c).strip() for c in cols]
+                empty_headers = sum(1 for c in cleaned if c is None or c == '')
+                duplicates = len(cleaned) != len(set(cleaned))
+                # If more than half of headers are empty or there are duplicates, treat as invalid
+                if len(cols) == 0:
+                    logging.info("Header detection: no columns found with header=1, falling back to header=0")
+                    df0 = pd.read_excel(path, sheet_name=sheet_name, header=0)
+                    return df0, 0
+                if empty_headers > (len(cols) / 2) or duplicates:
+                    logging.info(f"Header=1 appears invalid (empty_headers={empty_headers}, duplicates={duplicates}); falling back to header=0")
+                    df0 = pd.read_excel(path, sheet_name=sheet_name, header=0)
+                    return df0, 0
+                logging.info("Read with header=1 (data expected to start on row 3)")
+                return df_try, 1
+            except Exception as e:
+                logging.warning(f"Intento header=1 falló: {e}; intentando header=0")
+                df0 = pd.read_excel(path, sheet_name=sheet_name, header=0)
+                return df0, 0
+
+        # Expected headers (human names) - define before header-guess so the heuristic can use them
+        expected = [
+            'No', 'Semana', 'Fuente de Prospecto', 'Cliente', 'Bloque de prospección', 'Tipo de cliente', 'ZONA GEOGRAFICA',
+            'Segmento', 'Clasificación de la oportunidad %', 'FUNNEL', 'Contacto', 'Correo Electronico', 'Telefono', 'Puesto',
+            'Fecha Contacto Inicial', 'Fecha Ultimo contacto', 'Evento Ultimo Contacto', 'Dias en Pipeline', 'Responsable de Seguimiento',
+            'Status', 'Producto a Transportar', 'Tipo de cliente (por su actividad)', 'Nombre de intermediario', 'Segmento',
+            'Proveedor Actual', 'Ubicación de Negociación', 'Proyecto Cross Selling / Quien Genero la oportunidad',
+            'IMPO', 'EXPO', 'NAC', 'DED', 'INTMDL', 'Mudanza', 'SPOT', 'CIRCUITO', 'PUERTOS', 'Origen', 'Destino', 'Bitacora de seguimiento'
+        ]
+
+        def nk(s: str) -> str:
+            if s is None:
+                return ''
+            ss = str(s).replace('\xa0', ' ')
+            ss = unicodedata.normalize('NFKD', ss)
+            ss = ''.join(c for c in ss if not unicodedata.combining(c))
+            return re.sub(r"\s+", " ", ss).strip().upper()
+
+        normalized_expected_map = {nk(e): e for e in expected}
+
+        df, _used_header = _read_with_header_guess(file_path, sheet_to_use)
         df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
         df = df.where(pd.notnull(df), None)
 
@@ -784,4 +852,327 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
         return processed_count
     except Exception as e:
         logging.error(f"Error procesando pipeline transporte {file_path}: {e}")
+        raise
+
+
+def process_pipeline_comercial(file_path: str, db: object, username: Optional[str] = None, original_name: Optional[str] = None) -> int:
+    """Process a pipelineComercial Excel file into dbo.pipeline_comercial_tmp.
+
+    Validations:
+    - filename must match pipelineComercial_semXX_DD-MM-AAAA (week, day, month, year)
+    - sheet name must contain 'PIPELINE' (case-insensitive)
+    - caller provides a DB session; inserts are executed but not committed here (caller should commit once)
+
+    Returns number of rows processed (omitting rows whose first column is empty).
+    """
+    logging.info(f"Procesando pipeline comercial: {file_path}")
+    try:
+        # Load workbook and pick sheet containing 'PIPELINE'
+        sheet_to_use = None
+        with pd.ExcelFile(file_path) as xls:
+            for s in xls.sheet_names:
+                if 'PIPELINE' in s.upper():
+                    sheet_to_use = s
+                    break
+        if sheet_to_use is None:
+            raise ValueError("Hoja que contiene 'PIPELINE' no encontrada en el archivo Excel")
+
+        # Expected headers (human names) - used by the header-detection heuristic
+        expected = [
+            'No', 'Semana', 'Fuente de Prospecto', 'Cliente', 'Bloque de prospección', 'Tipo de cliente', 'ZONA GEOGRAFICA',
+            'Segmento', 'Clasificación de la oportunidad %', 'FUNNEL', 'Contacto', 'Correo Electronico', 'Telefono', 'Puesto',
+            'Fecha Contacto Inicial', 'Fecha Ultimo contacto', 'Evento Ultimo Contacto', 'Dias en Pipeline', 'Responsable de Seguimiento',
+            'Status', 'Producto a Transportar', 'Tipo de cliente (por su actividad)', 'Nombre de intermediario', 'Segmento',
+            'Proveedor Actual', 'Ubicación de Negociación', 'Proyecto Cross Selling / Quien Genero la oportunidad',
+            'IMPO', 'EXPO', 'NAC', 'DED', 'INTMDL', 'Mudanza', 'SPOT', 'CIRCUITO', 'PUERTOS', 'Origen', 'Destino', 'Bitacora de seguimiento'
+        ]
+
+        def nk(s: str) -> str:
+            if s is None:
+                return ''
+            ss = str(s).replace('\xa0', ' ')
+            ss = unicodedata.normalize('NFKD', ss)
+            ss = ''.join(c for c in ss if not unicodedata.combining(c))
+            return re.sub(r"\s+", " ", ss).strip().upper()
+
+        normalized_expected_map = {nk(e): e for e in expected}
+
+        # For pipeline comercial files we expect the real header to be on row 2 (so data starts on row 3)
+        # and the first physical column is empty and should be skipped. Read deterministically with
+        # header=1 and then drop the first physical column (column index 0). This avoids heuristic
+        # ambiguity and matches the provided file convention.
+        try:
+            # Read deterministically: headers are on Excel row 3 (header=2), so data starts on row 4.
+            df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=2)
+            logging.info(f"Reading pipeline comercial sheet '{sheet_to_use}' with header=2 (headers on row 3, data starts on row 4)")
+        except Exception as read_err:
+            logging.error(f"No se pudo leer sheet {sheet_to_use} con header=2: {read_err}")
+            raise
+
+        # If the first physical column is empty/placeholder, drop it so logical columns start at physical col 2
+        try:
+            if df.shape[1] >= 2:
+                # Drop the first physical column because it's always empty per file convention.
+                df = df.iloc[:, 1:].copy()
+                logging.info(f"Dropped first physical column; columns now: {list(df.columns)}")
+            else:
+                logging.warning(f"Sheet {sheet_to_use} tiene menos de 2 columnas; no se eliminó la primera columna")
+        except Exception as drop_err:
+            logging.warning(f"No se pudo eliminar la primera columna física: {drop_err}")
+
+        df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
+        df = df.where(pd.notnull(df), None)
+
+        # Omitir filas con primer campo vacío
+        if df.shape[1] > 0:
+            # after dropping the first physical column, logical first column is at index 0
+            first_col = df.columns[0]
+            before_count = len(df)
+            try:
+                non_empty_mask = df[first_col].notnull() & (df[first_col].astype(str).str.strip() != '')
+            except Exception:
+                non_empty_mask = df[first_col].notnull()
+            df = df[non_empty_mask]
+            after_count = len(df)
+            dropped = before_count - after_count
+            if dropped > 0:
+                logging.info(f"PipelineComercial: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+
+        records = df.to_dict(orient='records')
+        processed_count = len(records)
+
+        
+        normalized_key_map = {nk(k): k for k in list(df.columns)}
+        
+
+        insert_sql = (
+            "INSERT INTO dbo.pipeline_comercial_tmp (No, Semana, Fuente_Prospecto, Cliente, Bloque_Prospeccion, Tipo_Cliente, Zona_Geografica, Segmento, Clasificacion_Oportunidad, Funnel, Contacto, Correo_Electronico, Telefono, Puesto, Fecha_Contacto_Inicial, Fecha_Ultimo_Contacto, Evento_Ultimo_Contacto, Dias_en_Pipeline, Responsable_Seguimiento, Status, Producto_a_Transportar, Tipo_Cliente_Actividad, Nombre_Intermediario, Segmento_Secundario, Proveedor_Actual, Ubicacion_Negociacion, Proyecto_Cross_Selling, IMPO, EXPO, NAC, DED, INTMDL, Mudanza, SPOT, CIRCUITO, PUERTOS, Origen, Destino, Bitacora_Seguimiento, Usuario_Creacion) "
+            "VALUES (:No, :Semana, :Fuente_Prospecto, :Cliente, :Bloque_Prospeccion, :Tipo_Cliente, :Zona_Geografica, :Segmento, :Clasificacion_Oportunidad, :Funnel, :Contacto, :Correo_Electronico, :Telefono, :Puesto, :Fecha_Contacto_Inicial, :Fecha_Ultimo_Contacto, :Evento_Ultimo_Contacto, :Dias_en_Pipeline, :Responsable_Seguimiento, :Status, :Producto_a_Transportar, :Tipo_Cliente_Actividad, :Nombre_Intermediario, :Segmento_Secundario, :Proveedor_Actual, :Ubicacion_Negociacion, :Proyecto_Cross_Selling, :IMPO, :EXPO, :NAC, :DED, :INTMDL, :Mudanza, :SPOT, :CIRCUITO, :PUERTOS, :Origen, :Destino, :Bitacora_Seguimiento, :Usuario_Creacion)"
+        )
+
+        total_inserted = 0
+        for idx, rec in enumerate(records, start=1):
+            params = {
+                'No': None, 'Semana': None, 'Fuente_Prospecto': None, 'Cliente': None, 'Bloque_Prospeccion': None,
+                'Tipo_Cliente': None, 'Zona_Geografica': None, 'Segmento': None, 'Clasificacion_Oportunidad': None, 'Funnel': None,
+                'Contacto': None, 'Correo_Electronico': None, 'Telefono': None, 'Puesto': None, 'Fecha_Contacto_Inicial': None,
+                'Fecha_Ultimo_Contacto': None, 'Evento_Ultimo_Contacto': None, 'Dias_en_Pipeline': None, 'Responsable_Seguimiento': None,
+                'Status': None, 'Producto_a_Transportar': None, 'Tipo_Cliente_Actividad': None, 'Nombre_Intermediario': None,
+                'Segmento_Secundario': None, 'Proveedor_Actual': None, 'Ubicacion_Negociacion': None, 'Proyecto_Cross_Selling': None,
+                'IMPO': 0, 'EXPO': 0, 'NAC': 0, 'DED': 0, 'INTMDL': 0, 'Mudanza': 0, 'SPOT': 0, 'CIRCUITO': 0, 'PUERTOS': 0,
+                'Origen': None, 'Destino': None, 'Bitacora_Seguimiento': None, 'Usuario_Creacion': username
+            }
+
+            for norm_key, col in normalized_key_map.items():
+                if norm_key in normalized_expected_map:
+                    val = rec.get(col)
+                    if isinstance(val, str):
+                        val = val.replace('\xa0', ' ').strip()
+                        if val == '':
+                            val = None
+
+                    # Dates: try month-first then day-first
+                    if val is not None and norm_key in (nk('Fecha Contacto Inicial'), nk('Fecha Ultimo contacto')):
+                        try:
+                            if hasattr(val, 'to_pydatetime'):
+                                val = val.to_pydatetime()
+                            elif isinstance(val, _dt):
+                                pass
+                            else:
+                                parsed = pd.to_datetime(val, errors='coerce', dayfirst=False)
+                                if pd.isna(parsed):
+                                    parsed = pd.to_datetime(val, errors='coerce', dayfirst=True)
+                                if not pd.isna(parsed):
+                                    val = parsed.to_pydatetime()
+                                else:
+                                    val = None
+                        except Exception:
+                            val = None
+
+                    # Numeric coercion
+                    if val is not None and norm_key == nk('Clasificación de la oportunidad %'):
+                        try:
+                            s = re.sub(r"[^0-9.,\-]", "", str(val))
+                            if s == '':
+                                val = None
+                            else:
+                                if s.count(',') > 0 and s.count('.') == 0:
+                                    s = s.replace(',', '.')
+                                elif s.count(',') > 0 and s.count('.') > 0:
+                                    if s.rfind('.') > s.rfind(','):
+                                        s = s.replace(',', '')
+                                    else:
+                                        s = s.replace('.', '').replace(',', '.')
+                                d = Decimal(s)
+                                val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            try:
+                                val = float(str(val).replace(',', '.'))
+                            except Exception:
+                                val = None
+
+                    if val is not None and norm_key in (nk('Semana'),):
+                        try:
+                            val = int(float(str(val).replace(',', '.')))
+                        except Exception:
+                            val = None
+
+                    if val is not None and norm_key == nk('Dias en Pipeline'):
+                        try:
+                            val = int(float(str(val).replace(',', '.')))
+                        except Exception:
+                            val = None
+
+                    # Flags: coerce common yes/si/1/TRUE to 1
+                    if val is not None and norm_key in (nk('IMPO'), nk('EXPO'), nk('NAC'), nk('DED'), nk('INTMDL'), nk('Mudanza'), nk('SPOT'), nk('CIRCUITO'), nk('PUERTOS')):
+                        try:
+                            sval = str(val).strip().upper()
+                            if sval in ('1', 'YES', 'Y', 'SI', 'S', 'TRUE', 'T'):
+                                val = 1
+                            else:
+                                val = 0
+                        except Exception:
+                            val = 0
+
+                    # Assign to params by normalized name
+                    if norm_key == nk('No'):
+                        params['No'] = val
+                    elif norm_key == nk('Semana'):
+                        params['Semana'] = val
+                    elif norm_key == nk('Fuente de Prospecto'):
+                        params['Fuente_Prospecto'] = val
+                    elif norm_key == nk('Cliente'):
+                        params['Cliente'] = val
+                    elif norm_key == nk('Bloque de prospección'):
+                        params['Bloque_Prospeccion'] = val
+                    elif norm_key == nk('Tipo de cliente'):
+                        params['Tipo_Cliente'] = val
+                    elif norm_key == nk('ZONA GEOGRAFICA'):
+                        params['Zona_Geografica'] = val
+                    elif norm_key == nk('Segmento'):
+                        # Ambiguity: map to Segmento_Secundario if Segmento_Secundario already filled; else Segmento
+                        if params.get('Segmento') is None:
+                            params['Segmento'] = val
+                        else:
+                            params['Segmento_Secundario'] = val
+                    elif norm_key == nk('Clasificación de la oportunidad %'):
+                        params['Clasificacion_Oportunidad'] = val
+                    elif norm_key == nk('FUNNEL'):
+                        params['Funnel'] = val
+                    elif norm_key == nk('Contacto'):
+                        params['Contacto'] = val
+                    elif norm_key == nk('Correo Electronico'):
+                        params['Correo_Electronico'] = val
+                    elif norm_key == nk('Telefono'):
+                        params['Telefono'] = val
+                    elif norm_key == nk('Puesto'):
+                        params['Puesto'] = val
+                    elif norm_key == nk('Fecha Contacto Inicial'):
+                        params['Fecha_Contacto_Inicial'] = val
+                    elif norm_key == nk('Fecha Ultimo contacto'):
+                        params['Fecha_Ultimo_Contacto'] = val
+                    elif norm_key == nk('Evento Ultimo Contacto'):
+                        params['Evento_Ultimo_Contacto'] = val
+                    elif norm_key == nk('Dias en Pipeline'):
+                        params['Dias_en_Pipeline'] = val
+                    elif norm_key == nk('Responsable de Seguimiento'):
+                        params['Responsable_Seguimiento'] = val
+                    elif norm_key == nk('Status'):
+                        params['Status'] = val
+                    elif norm_key == nk('Producto a Transportar'):
+                        params['Producto_a_Transportar'] = val
+                    elif norm_key == nk('Tipo de cliente (por su actividad)'):
+                        params['Tipo_Cliente_Actividad'] = val
+                    elif norm_key == nk('Nombre de intermediario'):
+                        params['Nombre_Intermediario'] = val
+                    elif norm_key == nk('Proveedor Actual'):
+                        params['Proveedor_Actual'] = val
+                    elif norm_key == nk('Ubicación de Negociación'):
+                        params['Ubicacion_Negociacion'] = val
+                    elif norm_key == nk('Proyecto Cross Selling / Quien Genero la oportunidad'):
+                        params['Proyecto_Cross_Selling'] = val
+                    elif norm_key == nk('IMPO'):
+                        params['IMPO'] = int(val) if val is not None else 0
+                    elif norm_key == nk('EXPO'):
+                        params['EXPO'] = int(val) if val is not None else 0
+                    elif norm_key == nk('NAC'):
+                        params['NAC'] = int(val) if val is not None else 0
+                    elif norm_key == nk('DED'):
+                        params['DED'] = int(val) if val is not None else 0
+                    elif norm_key == nk('INTMDL'):
+                        params['INTMDL'] = int(val) if val is not None else 0
+                    elif norm_key == nk('Mudanza'):
+                        params['Mudanza'] = int(val) if val is not None else 0
+                    elif norm_key == nk('SPOT'):
+                        params['SPOT'] = int(val) if val is not None else 0
+                    elif norm_key == nk('CIRCUITO'):
+                        params['CIRCUITO'] = int(val) if val is not None else 0
+                    elif norm_key == nk('PUERTOS'):
+                        params['PUERTOS'] = int(val) if val is not None else 0
+                    elif norm_key == nk('Origen'):
+                        params['Origen'] = val
+                    elif norm_key == nk('Destino'):
+                        params['Destino'] = val
+                    elif norm_key == nk('Bitacora de seguimiento'):
+                        params['Bitacora_Seguimiento'] = val
+
+            # Safety: avoid int->text misbindings
+            for k in list(params.keys()):
+                v = params[k]
+                if isinstance(v, int) and k not in ('Semana', 'Dias_en_Pipeline', 'IMPO', 'EXPO', 'NAC', 'DED', 'INTMDL', 'Mudanza', 'SPOT', 'CIRCUITO', 'PUERTOS', 'No'):
+                    try:
+                        params[k] = str(v)
+                    except Exception:
+                        pass
+
+            # Log the parameters being inserted (serialize datetimes/decimals) to help debugging
+            try:
+                def _serialize_val(v):
+                    if v is None:
+                        return None
+                    try:
+                        if isinstance(v, _dt):
+                            return v.isoformat()
+                    except Exception:
+                        pass
+                    try:
+                        if isinstance(v, Decimal):
+                            return str(v)
+                    except Exception:
+                        pass
+                    return v
+
+                loggable = {k: _serialize_val(v) for k, v in params.items()}
+                logging.info(f"PipelineComercial insert fila {idx}: {loggable}")
+            except Exception as log_ex:
+                logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
+
+            db.execute(text(insert_sql), params)
+            try:
+                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+            except Exception:
+                affected = None
+            try:
+                total_inserted += int(affected) if affected is not None else 0
+            except Exception:
+                pass
+
+        # After inserts, call sp_proc_ontime if provided
+        if username and original_name:
+            processed_name = original_name
+            if processed_name.lower().startswith('temp_'):
+                processed_name = processed_name[5:]
+            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
+            logging.info(f"Ejecutando dbo.sp_proc_ontime para pipeline comercial usuario={username}, archivo={processed_name}")
+            db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
+            try:
+                sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+            except Exception:
+                sp2_af = None
+            logging.info(f"dbo.sp_proc_ontime (pipeline_comercial) @@ROWCOUNT={sp2_af}")
+
+        logging.info(f"PipelineComercial: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        return processed_count
+    except Exception as e:
+        logging.error(f"Error procesando pipeline comercial {file_path}: {e}")
         raise
