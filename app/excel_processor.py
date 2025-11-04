@@ -1176,3 +1176,294 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
     except Exception as e:
         logging.error(f"Error procesando pipeline comercial {file_path}: {e}")
         raise
+
+
+def process_disponibilidad_transporte(file_path: str, db: object, username: Optional[str] = None, original_name: Optional[str] = None) -> int:
+    """Process disponibilidadTransporte files into dbo.disponibilidad_transporte_tmp.
+
+    Rules:
+    - Filename convention verified by caller (endpoint); this function expects to receive
+      the saved temp file path and a DB session.
+    - Select sheet whose name contains 'OCT25' (case-insensitive).
+    - Read deterministically with header=2 (headers on Excel row 3) and drop first physical column
+      so logical columns start at physical column 2.
+    - Omit rows whose first logical column (after drop) is empty/null.
+    - Insert rows (no commit) into dbo.disponibilidad_transporte_tmp in the exact column order:
+      Fecha, Capacidad, LT, Origen, Destino, Ruta, Disponibilidad, Ejecutiva, Cliente,
+      Ofertado_Desde, Clasificacion_PQ_No_Cargo, No_Cargo_Por, Incidencias_Ejecutivas, Usuario_Creacion
+    - After successful inserts, call dbo.sp_proc_ontime(:nombre_usuario, :name_file_procesado) if username and original_name provided.
+
+    Returns number of rows inserted (omitting empty-first-column rows).
+    """
+    logging.info(f"Procesando disponibilidad transporte: {file_path}")
+    try:
+        # Find OCT25 sheet
+        sheet_to_use = None
+        with pd.ExcelFile(file_path) as xls:
+            for s in xls.sheet_names:
+                if 'OCT25' in s.upper() or 'OCT 25' in s.upper():
+                    sheet_to_use = s
+                    break
+        if sheet_to_use is None:
+            raise ValueError("Hoja 'OCT25' no encontrada en el archivo Excel")
+
+        # Read with header=0 (Excel row 1 is header) per validation request: header row = 1, first record = row 2
+        try:
+            df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=0)
+            logging.info(f"Reading disponibilidad sheet '{sheet_to_use}' with header=0 (headers on row 1)")
+        except Exception as read_err:
+            logging.error(f"No se pudo leer sheet {sheet_to_use} con header=0: {read_err}")
+            raise
+
+        # Helper to normalize strings (used by validation)
+        def nk(s: str) -> str:
+            if s is None:
+                return ''
+            ss = str(s).replace('\xa0', ' ')
+            ss = unicodedata.normalize('NFKD', ss)
+            ss = ''.join(c for c in ss if not unicodedata.combining(c))
+            return re.sub(r"\s+", " ", ss).strip().upper()
+
+        # Validate that the header is on Excel row 1 and the first data row is row 2.
+        # Heuristic: if the first data row (df.iloc[0]) contains mostly values equal to the header names
+        # (after normalization), it's likely the file has header on row 2 instead. In that case we raise.
+        try:
+            if df.shape[0] < 1:
+                raise ValueError("El sheet no contiene filas de datos")
+            cols = list(df.columns)
+            # Normalize column names and first data row values
+            normalized_cols = {nk(c) for c in cols}
+            first_row_vals = df.iloc[0]
+            match_count = 0
+            total_checked = 0
+            for c in cols:
+                try:
+                    v = first_row_vals.get(c)
+                except Exception:
+                    v = None
+                if v is None:
+                    # empty cell doesn't count
+                    continue
+                total_checked += 1
+                if isinstance(v, str):
+                    if nk(v) in normalized_cols:
+                        match_count += 1
+                else:
+                    # non-string values are unlikely to be headers
+                    pass
+
+            # If more than half of non-empty first-row cells match header names, suspect header is on row 2
+            if total_checked > 0 and match_count > (len(cols) / 2):
+                raise ValueError("Se esperaba que la fila 1 contenga los encabezados y la fila 2 el primer registro; el archivo parece tener el encabezado en otra fila")
+        except Exception as v_err:
+            logging.error(f"Validación de encabezado falló: {v_err}")
+            raise
+
+        df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
+        df = df.where(pd.notnull(df), None)
+
+        # Omitir filas con primer campo vacío
+        processed_count = 0
+        if df.shape[1] > 0:
+            first_col = df.columns[0]
+            before_count = len(df)
+            try:
+                non_empty_mask = df[first_col].notnull() & (df[first_col].astype(str).str.strip() != '')
+            except Exception:
+                non_empty_mask = df[first_col].notnull()
+            df = df[non_empty_mask]
+            after_count = len(df)
+            dropped = before_count - after_count
+            if dropped > 0:
+                logging.info(f"Disponibilidad: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+
+        records = df.to_dict(orient='records')
+        processed_count = len(records)
+
+        # Expected logical headers (approximate human names) - we'll do normalization
+        expected = [
+            'FECHA', 'CAPACIDAD', 'LT', 'ORIGEN', 'DESTINO', 'RUTA', 'DISPONIBILIDAD', 'EJECUTIVA', 'CLIENTE',
+            'OFERTADO DESDE', 'CLASIFICACION PQ NO CARGO', 'NO CARGO POR', 'INCIDENCIAS EJECUTIVAS'
+        ]
+
+        def nk(s: str) -> str:
+            if s is None:
+                return ''
+            ss = str(s).replace('\xa0', ' ')
+            ss = unicodedata.normalize('NFKD', ss)
+            ss = ''.join(c for c in ss if not unicodedata.combining(c))
+            return re.sub(r"\s+", " ", ss).strip().upper()
+
+        normalized_expected = {nk(e): e for e in expected}
+        normalized_key_map = {nk(k): k for k in list(df.columns)}
+
+        insert_sql = (
+            "INSERT INTO dbo.disponibilidad_transporte_tmp (Fecha, Capacidad, LT, Origen, Destino, Ruta, Disponibilidad, Ejecutiva, Cliente, Ofertado_Desde, Clasificacion_PQ_No_Cargo, No_Cargo_Por, Incidencias_Ejecutivas, Usuario_Creacion) "
+            "VALUES (:Fecha, :Capacidad, :LT, :Origen, :Destino, :Ruta, :Disponibilidad, :Ejecutiva, :Cliente, :Ofertado_Desde, :Clasificacion_PQ_No_Cargo, :No_Cargo_Por, :Incidencias_Ejecutivas, :Usuario_Creacion)"
+        )
+
+        total_inserted = 0
+        for idx, rec in enumerate(records, start=1):
+            params = {
+                'Fecha': None, 'Capacidad': None, 'LT': None, 'Origen': None, 'Destino': None, 'Ruta': None,
+                'Disponibilidad': None, 'Ejecutiva': None, 'Cliente': None, 'Ofertado_Desde': None,
+                'Clasificacion_PQ_No_Cargo': None, 'No_Cargo_Por': None, 'Incidencias_Ejecutivas': None,
+                'Usuario_Creacion': username
+            }
+
+            for norm_key, col in normalized_key_map.items():
+                if norm_key in normalized_expected:
+                    val = rec.get(col)
+                    # Normalize strings
+                    if isinstance(val, str):
+                        val = val.replace('\xa0', ' ').strip()
+                        if val == '':
+                            val = None
+
+                    # Fecha parsing
+                    if val is not None and norm_key == nk('FECHA'):
+                        try:
+                            if hasattr(val, 'to_pydatetime'):
+                                val = val.to_pydatetime()
+                            elif isinstance(val, _dt):
+                                pass
+                            else:
+                                parsed = pd.to_datetime(val, errors='coerce', dayfirst=False)
+                                if pd.isna(parsed):
+                                    parsed = pd.to_datetime(val, errors='coerce', dayfirst=True)
+                                if not pd.isna(parsed):
+                                    val = parsed.to_pydatetime()
+                                else:
+                                    logging.debug(f"No se pudo parsear Fecha en fila {idx} columna {col}: {val}")
+                                    val = None
+                        except Exception:
+                            val = None
+
+                    # Capacidad numeric -> Decimal(12,2)
+                    if val is not None and norm_key == nk('CAPACIDAD'):
+                        try:
+                            s = re.sub(r"[^0-9.,\-]", "", str(val))
+                            if s == '':
+                                val = None
+                            else:
+                                if s.count(',') > 0 and s.count('.') == 0:
+                                    s = s.replace(',', '.')
+                                elif s.count(',') > 0 and s.count('.') > 0:
+                                    if s.rfind('.') > s.rfind(','):
+                                        s = s.replace(',', '')
+                                    else:
+                                        s = s.replace('.', '').replace(',', '.')
+                                d = Decimal(s)
+                                val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            try:
+                                val = float(str(val).replace(',', '.'))
+                            except Exception:
+                                val = None
+
+                    # Ofertado_Desde -> date parsing
+                    if val is not None and norm_key == nk('OFERTADO DESDE'):
+                        try:
+                            if hasattr(val, 'to_pydatetime'):
+                                val = val.to_pydatetime()
+                            elif isinstance(val, _dt):
+                                pass
+                            else:
+                                parsed = pd.to_datetime(val, errors='coerce', dayfirst=False)
+                                if pd.isna(parsed):
+                                    parsed = pd.to_datetime(val, errors='coerce', dayfirst=True)
+                                if not pd.isna(parsed):
+                                    val = parsed.to_pydatetime()
+                                else:
+                                    val = None
+                        except Exception:
+                            val = None
+
+                    # Assign to params
+                    if norm_key == nk('FECHA'):
+                        params['Fecha'] = val
+                    elif norm_key == nk('CAPACIDAD'):
+                        params['Capacidad'] = val
+                    elif norm_key == nk('LT'):
+                        params['LT'] = val
+                    elif norm_key == nk('ORIGEN'):
+                        params['Origen'] = val
+                    elif norm_key == nk('DESTINO'):
+                        params['Destino'] = val
+                    elif norm_key == nk('RUTA'):
+                        params['Ruta'] = val
+                    elif norm_key == nk('DISPONIBILIDAD'):
+                        params['Disponibilidad'] = val
+                    elif norm_key == nk('EJECUTIVA'):
+                        params['Ejecutiva'] = val
+                    elif norm_key == nk('CLIENTE'):
+                        params['Cliente'] = val
+                    elif norm_key == nk('OFERTADO DESDE'):
+                        params['Ofertado_Desde'] = val
+                    elif norm_key == nk('CLASIFICACION PQ NO CARGO'):
+                        params['Clasificacion_PQ_No_Cargo'] = val
+                    elif norm_key == nk('NO CARGO POR'):
+                        params['No_Cargo_Por'] = val
+                    elif norm_key == nk('INCIDENCIAS EJECUTIVAS'):
+                        params['Incidencias_Ejecutivas'] = val
+
+            # Safety: convert ints to strings for textual columns where appropriate
+            for k in list(params.keys()):
+                v = params[k]
+                if isinstance(v, int) and k not in ('Capacidad',):
+                    try:
+                        params[k] = str(v)
+                    except Exception:
+                        pass
+
+            # Log params for debugging (serialize datetimes/decimals)
+            try:
+                def _serialize_val(v):
+                    if v is None:
+                        return None
+                    try:
+                        if isinstance(v, _dt):
+                            return v.isoformat()
+                    except Exception:
+                        pass
+                    try:
+                        if isinstance(v, Decimal):
+                            return str(v)
+                    except Exception:
+                        pass
+                    return v
+
+                loggable = {k: _serialize_val(v) for k, v in params.items()}
+                logging.info(f"Disponibilidad insert fila {idx}: {loggable}")
+            except Exception as log_ex:
+                logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
+
+            db.execute(text(insert_sql), params)
+            try:
+                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+            except Exception:
+                affected = None
+            try:
+                total_inserted += int(affected) if affected is not None else 0
+            except Exception:
+                pass
+
+        # After inserts, call sp_proc_ontime if username/original_name provided
+        if username and original_name:
+            processed_name = original_name
+            if processed_name.lower().startswith('temp_'):
+                processed_name = processed_name[5:]
+            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
+            logging.info(f"Ejecutando dbo.sp_proc_ontime para disponibilidad usuario={username}, archivo={processed_name}")
+            db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
+            try:
+                sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+            except Exception:
+                sp2_af = None
+            logging.info(f"dbo.sp_proc_ontime (disponibilidad) @@ROWCOUNT={sp2_af}")
+
+        logging.info(f"DisponibilidadTransporte: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        return processed_count
+    except Exception as e:
+        logging.error(f"Error procesando disponibilidad transporte {file_path}: {e}")
+        raise
