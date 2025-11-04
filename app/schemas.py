@@ -41,7 +41,8 @@ class BitacoraCreate(BitacoraBase):
 class BitacoraOut(BitacoraBase):
     id: int
     usuario_id: int
-    fecha: Optional[str]
+    # Store as datetime so FastAPI/Pydantic will serialize to ISO strings automatically
+    fecha: Optional[datetime]
     class Config:
         orm_mode = True
 
