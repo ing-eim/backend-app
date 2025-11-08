@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.database import SessionLocal, engine
 from app import models, schemas, crud, auth
-from app.excel_processor import process_excel, process_incidencias, process_pipeline_transporte, process_pipeline_comercial, process_disponibilidad_transporte, process_factoraje, process_relacion_pago, process_evidencias_pendientes
+from app.excel_processor import process_excel, process_incidencias, process_pipeline_transporte, process_pipeline_comercial, process_disponibilidad_transporte, process_factoraje, process_relacion_pago, process_evidencias_pendientes, process_venta_perdida
 import json
 from fastapi.encoders import jsonable_encoder
 from jose import JWTError, jwt
@@ -1064,6 +1064,106 @@ async def procesar_evidencias_pendientes(file: UploadFile = File(...), current_u
         raise
     except Exception as e:
         logging.error(f"Error procesando archivo evidencias_pendientes {name_only}: {e}")
+        raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
+
+
+@app.post("/procesar-venta-perdida/")
+@app.post("/procesar-venta-perdida")
+async def procesar_venta_perdida(file: UploadFile = File(...), current_user: models.Usuario = Depends(get_current_user)):
+    import os
+    # Validar nomenclatura: ventaPerdida_MM-AAAA (MM mes 2 dígitos, AAAA año 4 dígitos)
+    filename = file.filename or ""
+    name_only, _ext = os.path.splitext(filename)
+    m = re.match(r"^ventaPerdida_(\d{2})-(\d{4})$", name_only, re.IGNORECASE)
+    if not m:
+        logging.warning(f"Archivo ventaPerdida con nombre inválido recibido: {filename!r}")
+        raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'ventaPerdida_MM-AAAA'")
+
+    month = int(m.group(1))
+    year = int(m.group(2))
+    if month < 1 or month > 12 or year < 2000 or year > 2100:
+        logging.warning(f"Archivo ventaPerdida con mes/año inválido en el nombre: {name_only!r}")
+        raise HTTPException(status_code=400, detail="El mes o año en el nombre del archivo no es válido")
+
+    # Verificar en mi_bitacora_operaciones si ya fue procesado
+    try:
+        from app.database import SessionLocal as _SessionLocal
+        with _SessionLocal() as _db_check:
+            try:
+                sql_check = "SELECT TOP 1 nombre_usuario, fecha FROM dbo.mi_bitacora_operaciones WHERE name_file_load = :n1 OR name_file_load = :n2 ORDER BY fecha DESC"
+                row = _db_check.execute(text(sql_check), {"n1": name_only, "n2": filename}).fetchone()
+                if row is not None:
+                    proc_user = row[0]
+                    proc_fecha = row[1]
+                    try:
+                        if hasattr(proc_fecha, 'strftime'):
+                            proc_fecha_str = proc_fecha.strftime('%Y-%m-%d %H:%M:%S')
+                        else:
+                            proc_fecha_str = str(proc_fecha)
+                    except Exception:
+                        proc_fecha_str = str(proc_fecha)
+                    msg = f"El archivo ya fue procesado por {proc_user} el {proc_fecha_str}"
+                    logging.info(f"Archivo {filename} ya procesado: {msg}")
+                    raise HTTPException(status_code=400, detail=msg)
+            except HTTPException:
+                raise
+            except Exception as e:
+                logging.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        logging.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
+
+    try:
+        file_location = f"temp_{file.filename}"
+        with open(file_location, "wb") as f:
+            f.write(await file.read())
+
+        # Open DB session and call process_venta_perdida inside single transaction
+        try:
+            from app.database import SessionLocal
+            with SessionLocal() as db:
+                try:
+                    inserted = process_venta_perdida(file_location, db=db, username=current_user.nombre_usuario, original_name=name_only)
+                    # commit once
+                    db.commit()
+                except Exception as pi_err:
+                    tb = traceback.format_exc()
+                    logging.error(f"Error procesando venta perdida y ejecutando SP: {pi_err}\n{tb}")
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    try:
+                        safe_remove(file_location)
+                    except Exception as rm_err:
+                        logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
+                    return JSONResponse(status_code=500, content={"rows_inserted": 0, "error": "Error al procesar archivo venta perdida; verificar api.log"})
+        except Exception:
+            # Fallback: try to parse without DB (but we cannot insert), return error
+            try:
+                import pandas as _pd
+                df = _pd.read_excel(file_location)
+                rows = len(df)
+            except Exception:
+                rows = 0
+            try:
+                safe_remove(file_location)
+            except Exception:
+                pass
+            return JSONResponse(status_code=500, content={"rows_inserted": 0, "error": "No se pudo abrir sesión DB para insertar venta perdida; verificar api.log"})
+
+        # cleanup temp
+        try:
+            safe_remove(file_location)
+        except Exception as del_err:
+            logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
+
+        return {"rows_inserted": inserted}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error procesando archivo ventaPerdida {name_only}: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 
 

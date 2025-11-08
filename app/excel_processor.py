@@ -1876,6 +1876,262 @@ def process_relacion_pago(file_path: str, db: object, username: Optional[str] = 
         raise
 
 
+def process_venta_perdida(file_path: str, db: object, username: Optional[str] = None, original_name: Optional[str] = None) -> int:
+    """Process venta perdida files into dbo.venta_perdida_tmp.
+
+    - Filename validated by caller; this function expects the saved temp file path and a DB session.
+    - Reads the sheet whose name equals the year present in original_name (e.g., '2025'). Falls back to first sheet.
+    - Maps columns to: Ejecutivo, Cliente, Capacidad, Total_Vta_Perdida, Sin_Programa_Carga
+    - Inserts rows (no commit) into dbo.venta_perdida_tmp following that exact column order and calls sp_proc_ontime after inserts.
+
+    Returns number of rows processed.
+    """
+    logging.info(f"Procesando venta perdida: {file_path}")
+    try:
+        # Determine sheet name: prefer year from original_name
+        sheet_to_use = None
+        year_from_name = None
+        if original_name:
+            m = re.search(r"(\d{4})", original_name)
+            if m:
+                year_from_name = m.group(1)
+
+        with pd.ExcelFile(file_path) as xls:
+            if year_from_name:
+                for s in xls.sheet_names:
+                    if s.strip() == year_from_name:
+                        sheet_to_use = s
+                        break
+            # fallback: choose first sheet
+            if sheet_to_use is None:
+                sheet_to_use = xls.sheet_names[0]
+
+        try:
+            df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=0)
+            logging.info(f"Reading venta perdida sheet '{sheet_to_use}' with header=0")
+        except Exception as read_err:
+            logging.error(f"No se pudo leer la hoja {sheet_to_use}: {read_err}")
+            raise
+
+        df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
+        df = df.where(pd.notnull(df), None)
+
+        # Omit rows where first column empty
+        if df.shape[1] > 0:
+            first_col = df.columns[0]
+            before_count = len(df)
+            try:
+                non_empty_mask = df[first_col].notnull() & (df[first_col].astype(str).str.strip() != '')
+            except Exception:
+                non_empty_mask = df[first_col].notnull()
+            df = df[non_empty_mask]
+            after_count = len(df)
+            dropped = before_count - after_count
+            if dropped > 0:
+                logging.info(f"VentaPerdida: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+
+        records = df.to_dict(orient='records')
+        processed_count = len(records)
+
+        def nk(s: str) -> str:
+            if s is None:
+                return ''
+            ss = str(s).replace('\xa0', ' ')
+            ss = unicodedata.normalize('NFKD', ss)
+            ss = ''.join(c for c in ss if not unicodedata.combining(c))
+            return re.sub(r"\s+", " ", ss).strip().upper()
+
+        normalized_key_map = {nk(k): k for k in list(df.columns)}
+
+        # Include all columns required by dbo.venta_perdida_tmp
+        insert_sql = (
+            "INSERT INTO dbo.venta_perdida_tmp (Fecha_De_Oferta, No_De_Carga, Origen, Destino, Ruta, Fecha_De_Carga, Ejecutivo, Cliente, Capacidad, Total_Vta_Perdida, Sin_Programa_Carga, Usuario_Creacion) "
+            "VALUES (:Fecha_De_Oferta, :No_De_Carga, :Origen, :Destino, :Ruta, :Fecha_De_Carga, :Ejecutivo, :Cliente, :Capacidad, :Total_Vta_Perdida, :Sin_Programa_Carga, :Usuario_Creacion)"
+        )
+
+        total_inserted = 0
+        for idx, rec in enumerate(records, start=1):
+            params = {
+                'Fecha_De_Oferta': None, 'No_De_Carga': None, 'Origen': None, 'Destino': None, 'Ruta': None,
+                'Fecha_De_Carga': None, 'Ejecutivo': None, 'Cliente': None, 'Capacidad': None, 'Total_Vta_Perdida': None,
+                'Sin_Programa_Carga': None, 'Usuario_Creacion': username
+            }
+
+            for norm_key, col in normalized_key_map.items():
+                val = rec.get(col)
+                if isinstance(val, str):
+                    val = val.replace('\xa0', ' ').strip()
+                    if val == '':
+                        val = None
+
+                # Fecha de oferta
+                if 'FECHA' in norm_key and 'OFERT' in norm_key:
+                    if val is None:
+                        params['Fecha_De_Oferta'] = None
+                    else:
+                        try:
+                            if hasattr(val, 'to_pydatetime'):
+                                params['Fecha_De_Oferta'] = val.to_pydatetime()
+                            elif isinstance(val, _dt):
+                                params['Fecha_De_Oferta'] = val
+                            else:
+                                params['Fecha_De_Oferta'] = pd.to_datetime(str(val), dayfirst=False, errors='coerce')
+                                if pd.isna(params['Fecha_De_Oferta']):
+                                    params['Fecha_De_Oferta'] = pd.to_datetime(str(val), dayfirst=True, errors='coerce')
+                        except Exception:
+                            params['Fecha_De_Oferta'] = None
+
+                # No de carga (identificador)
+                elif ('NO' in norm_key and ('CARGA' in norm_key or 'CARGAS' in norm_key)) or ('NO' in norm_key and 'DE' in norm_key and 'CARGA' in norm_key) or 'NOCARGA' in norm_key:
+                    params['No_De_Carga'] = val
+
+                # Origen / Destino / Ruta
+                elif 'ORIGEN' in norm_key:
+                    params['Origen'] = val
+                elif 'DESTINO' in norm_key:
+                    params['Destino'] = val
+                elif 'RUTA' in norm_key:
+                    params['Ruta'] = val
+
+                # Fecha de carga
+                elif 'FECHA' in norm_key and 'CARGA' in norm_key:
+                    if val is None:
+                        params['Fecha_De_Carga'] = None
+                    else:
+                        try:
+                            if hasattr(val, 'to_pydatetime'):
+                                params['Fecha_De_Carga'] = val.to_pydatetime()
+                            elif isinstance(val, _dt):
+                                params['Fecha_De_Carga'] = val
+                            else:
+                                params['Fecha_De_Carga'] = pd.to_datetime(str(val), dayfirst=False, errors='coerce')
+                                if pd.isna(params['Fecha_De_Carga']):
+                                    params['Fecha_De_Carga'] = pd.to_datetime(str(val), dayfirst=True, errors='coerce')
+                        except Exception:
+                            params['Fecha_De_Carga'] = None
+
+                # Ejecutivo / Cliente
+                elif 'EJECUT' in norm_key:
+                    params['Ejecutivo'] = val
+                elif 'CLIENT' in norm_key:
+                    params['Cliente'] = val
+
+                # Capacidad (numeric)
+                elif 'CAPACIDAD' in norm_key:
+                    if val is None:
+                        params['Capacidad'] = None
+                    else:
+                        try:
+                            s = re.sub(r"[^0-9.,\-]", "", str(val))
+                            if s == '':
+                                params['Capacidad'] = None
+                            else:
+                                if s.count(',') > 0 and s.count('.') == 0:
+                                    s = s.replace(',', '.')
+                                elif s.count(',') > 0 and s.count('.') > 0:
+                                    if s.rfind('.') > s.rfind(','):
+                                        s = s.replace(',', '')
+                                    else:
+                                        s = s.replace('.', '').replace(',', '.')
+                                d = Decimal(s)
+                                params['Capacidad'] = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            try:
+                                params['Capacidad'] = Decimal(str(float(str(val).replace(',', '.')))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                            except Exception:
+                                params['Capacidad'] = None
+
+                # Total Vta Perdida
+                elif 'TOTAL' in norm_key and ('VTA' in norm_key or 'VENTA' in norm_key or 'PERDIDA' in norm_key or 'VTA PERDIDA' in norm_key or 'VTA_PERDIDA' in norm_key):
+                    if val is None:
+                        params['Total_Vta_Perdida'] = None
+                    else:
+                        try:
+                            s = re.sub(r"[^0-9.,\-]", "", str(val))
+                            if s == '':
+                                params['Total_Vta_Perdida'] = None
+                            else:
+                                if s.count(',') > 0 and s.count('.') == 0:
+                                    s = s.replace(',', '.')
+                                elif s.count(',') > 0 and s.count('.') > 0:
+                                    if s.rfind('.') > s.rfind(','):
+                                        s = s.replace(',', '')
+                                    else:
+                                        s = s.replace('.', '').replace(',', '.')
+                                d = Decimal(s)
+                                params['Total_Vta_Perdida'] = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            try:
+                                params['Total_Vta_Perdida'] = Decimal(str(float(str(val).replace(',', '.')))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                            except Exception:
+                                params['Total_Vta_Perdida'] = None
+
+                # Sin Programa de Carga (texto)
+                elif 'SIN' in norm_key and 'PROGRAMA' in norm_key:
+                    params['Sin_Programa_Carga'] = val
+
+            # Ensure textual fields are strings when they are ints
+            for k in ('No_De_Carga', 'Origen', 'Destino', 'Ruta', 'Ejecutivo', 'Cliente', 'Sin_Programa_Carga'):
+                v = params.get(k)
+                if isinstance(v, int):
+                    try:
+                        params[k] = str(v)
+                    except Exception:
+                        pass
+
+            # Serialize for logging
+            try:
+                def _serialize_val(v):
+                    if v is None:
+                        return None
+                    try:
+                        if isinstance(v, _dt):
+                            return v.isoformat()
+                    except Exception:
+                        pass
+                    try:
+                        if isinstance(v, Decimal):
+                            return str(v)
+                    except Exception:
+                        pass
+                    return v
+
+                loggable = {k: _serialize_val(v) for k, v in params.items()}
+                logging.info(f"VentaPerdida insert fila {idx}: {loggable}")
+            except Exception:
+                pass
+
+            db.execute(text(insert_sql), params)
+            try:
+                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+            except Exception:
+                affected = None
+            try:
+                total_inserted += int(affected) if affected is not None else 0
+            except Exception:
+                pass
+
+        # call sp_proc_ontime if provided
+        if username and original_name:
+            processed_name = original_name
+            if processed_name.lower().startswith('temp_'):
+                processed_name = processed_name[5:]
+            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
+            logging.info(f"Ejecutando dbo.sp_proc_ontime para VentaPerdida usuario={username}, archivo={processed_name}")
+            db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
+            try:
+                sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+            except Exception:
+                sp2_af = None
+            logging.info(f"dbo.sp_proc_ontime (VentaPerdida) @@ROWCOUNT={sp2_af}")
+
+        logging.info(f"VentaPerdida: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        return processed_count
+    except Exception as e:
+        logging.error(f"Error procesando Venta Perdida {file_path}: {e}")
+        raise
+
+
 def process_evidencias_pendientes(file_path: str, db: object, username: Optional[str] = None, original_name: Optional[str] = None) -> int:
     """Process evidencias pendientes files into dbo.evidencias_pendientes_tmp.
 
