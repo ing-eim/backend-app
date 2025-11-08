@@ -1874,3 +1874,235 @@ def process_relacion_pago(file_path: str, db: object, username: Optional[str] = 
     except Exception as e:
         logging.error(f"Error procesando Relacion Pago {file_path}: {e}")
         raise
+
+
+def process_evidencias_pendientes(file_path: str, db: object, username: Optional[str] = None, original_name: Optional[str] = None) -> int:
+    """Process evidencias pendientes files into dbo.evidencias_pendientes_tmp.
+
+    - Expects a sheet named 'TABLA' (case-insensitive).
+    - Validates and reads header row (header=0).
+    - Identifies the 'CLIENTE' column and treats the following columns as month-name columns.
+      MES1..MES4 are taken from the first four month columns found to the right of CLIENTE.
+    - Inserts rows (no commit) into dbo.evidencias_pendientes_tmp in the exact column order requested.
+    - Calls dbo.sp_proc_ontime(:nombre_usuario, :name_file_procesado) after successful inserts if username and original_name provided.
+
+    Returns number of rows processed.
+    """
+    logging.info(f"Procesando evidencias_pendientes: {file_path}")
+    try:
+        # Find sheet named 'TABLA'
+        sheet_to_use = None
+        with pd.ExcelFile(file_path) as xls:
+            for s in xls.sheet_names:
+                if s.strip().upper() == 'TABLA':
+                    sheet_to_use = s
+                    break
+        if sheet_to_use is None:
+            raise ValueError("Hoja 'TABLA' no encontrada en el archivo Excel")
+
+        try:
+            df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=0)
+            logging.info(f"Reading evidencias_pendientes sheet '{sheet_to_use}' with header=0")
+        except Exception as read_err:
+            logging.error(f"No se pudo leer la hoja TABLA: {read_err}")
+            raise
+
+        df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
+        df = df.where(pd.notnull(df), None)
+
+        # Normalize header keys
+        def nk(s: str) -> str:
+            if s is None:
+                return ''
+            ss = str(s).replace('\xa0', ' ')
+            ss = unicodedata.normalize('NFKD', ss)
+            ss = ''.join(c for c in ss if not unicodedata.combining(c))
+            return re.sub(r"\s+", " ", ss).strip().upper()
+
+        cols = list(df.columns)
+        normalized_map = {nk(c): c for c in cols}
+
+        if 'CLIENTE' not in normalized_map:
+            # try common alternatives
+            raise ValueError("No se encontró la columna 'CLIENTE' en la hoja TABLA")
+
+        cliente_col = normalized_map['CLIENTE']
+        cliente_index = cols.index(cliente_col)
+
+
+
+        # Month columns are the columns after the cliente column
+        month_cols = cols[cliente_index + 1:]
+        # Select first four month columns (if less than 4, fill with None)
+        month_cols = [c for c in month_cols if c is not None and str(c).strip() != '']
+        # Keep original header names for MesX
+        selected_month_cols = month_cols[:4]
+
+        records = df.to_dict(orient='records')
+        processed_count = len(records)
+
+        insert_sql = (
+            "INSERT INTO dbo.evidencias_pendientes_tmp (Cliente, Mes1, Total_Mes1, Mes2, Total_Mes2, Mes3, Total_Mes3, Mes4, Total_Mes4, Total_General, Usuario_Creacion) "
+            "VALUES (:Cliente, :Mes1, :Total_Mes1, :Mes2, :Total_Mes2, :Mes3, :Total_Mes3, :Mes4, :Total_Mes4, :Total_General, :Usuario_Creacion)"
+        )
+
+        total_inserted = 0
+        # detect if there is an explicit "Total general" column in the sheet
+        total_general_col = None
+        for k_norm, k in normalized_map.items():
+            if 'TOTAL' in k_norm and 'GENERAL' in k_norm:
+                total_general_col = k
+                break
+
+        for idx, rec in enumerate(records, start=1):
+            params = {
+                'Cliente': None,
+                'Mes1': None, 'Total_Mes1': None,
+                'Mes2': None, 'Total_Mes2': None,
+                'Mes3': None, 'Total_Mes3': None,
+                'Mes4': None, 'Total_Mes4': None,
+                'Total_General': None,
+                'Usuario_Creacion': username
+            }
+
+            # Cliente value
+            try:
+                cval = rec.get(cliente_col)
+            except Exception:
+                cval = None
+            if isinstance(cval, str):
+                cval = cval.replace('\xa0', ' ').strip()
+                if cval == '':
+                    cval = None
+            params['Cliente'] = cval
+
+         
+                # For each selected month column, set MesX to header name and Total_MesX to numeric value
+            for i in range(4):
+                header_name = None
+                cell_val = None
+                if i < len(selected_month_cols):
+                    header_name = selected_month_cols[i]
+                    cell_val = rec.get(header_name)
+                # store month header (as string) into MesX
+                params[f'Mes{i+1}'] = None if header_name is None else str(header_name).strip()
+
+                # Coerce numeric amount for Total_MesX
+                if cell_val is None or (isinstance(cell_val, str) and cell_val.strip() == ''):
+                    params[f'Total_Mes{i+1}'] = None
+                else:
+                    # sanitize and convert to Decimal
+                    try:
+                        if hasattr(cell_val, 'to_pydatetime'):
+                            # unlikely but treat as None
+                            params[f'Total_Mes{i+1}'] = None
+                        else:
+                            s = re.sub(r"[^0-9.,\-]", "", str(cell_val))
+                            if s == '':
+                                params[f'Total_Mes{i+1}'] = None
+                            else:
+                                if s.count(',') > 0 and s.count('.') == 0:
+                                    s = s.replace(',', '.')
+                                elif s.count(',') > 0 and s.count('.') > 0:
+                                    if s.rfind('.') > s.rfind(','):
+                                        s = s.replace(',', '')
+                                    else:
+                                        s = s.replace('.', '').replace(',', '.')
+                                d = Decimal(s)
+                                params[f'Total_Mes{i+1}'] = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                    except Exception:
+                        try:
+                            params[f'Total_Mes{i+1}'] = Decimal(str(float(str(cell_val).replace(',', '.')))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            params[f'Total_Mes{i+1}'] = None
+
+            # If an explicit Total General column exists, prefer its value
+            if total_general_col is not None:
+                tg_val = rec.get(total_general_col)
+                if tg_val is None or (isinstance(tg_val, str) and tg_val.strip() == ''):
+                    params['Total_General'] = None
+                else:
+                    try:
+                        s = re.sub(r"[^0-9.,\-]", "", str(tg_val))
+                        if s == '':
+                            params['Total_General'] = None
+                        else:
+                            if s.count(',') > 0 and s.count('.') == 0:
+                                s = s.replace(',', '.')
+                            elif s.count(',') > 0 and s.count('.') > 0:
+                                if s.rfind('.') > s.rfind(','):
+                                    s = s.replace(',', '')
+                                else:
+                                    s = s.replace('.', '').replace(',', '.')
+                            d = Decimal(s)
+                            params['Total_General'] = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                    except Exception:
+                        try:
+                            params['Total_General'] = Decimal(str(float(str(tg_val).replace(',', '.')))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            params['Total_General'] = None
+            else:
+                # Fallback: compute total from the Total_Mes* fields we parsed
+                try:
+                    sum_val = Decimal('0')
+                    any_num = False
+                    for j in range(1,5):
+                        mv = params.get(f'Total_Mes{j}')
+                        if mv is not None:
+                            any_num = True
+                            sum_val += Decimal(mv)
+                    params['Total_General'] = sum_val.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) if any_num else None
+                except Exception:
+                    params['Total_General'] = None
+
+            # Log params
+            try:
+                def _serialize_val(v):
+                    if v is None:
+                        return None
+                    try:
+                        if isinstance(v, _dt):
+                            return v.isoformat()
+                    except Exception:
+                        pass
+                    try:
+                        if isinstance(v, Decimal):
+                            return str(v)
+                    except Exception:
+                        pass
+                    return v
+
+                loggable = {k: _serialize_val(v) for k, v in params.items()}
+                logging.info(f"EvidenciasPendientes insert fila {idx}: {loggable}")
+            except Exception:
+                pass
+
+            db.execute(text(insert_sql), params)
+            try:
+                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+            except Exception:
+                affected = None
+            try:
+                total_inserted += int(affected) if affected is not None else 0
+            except Exception:
+                pass
+
+        # After inserts, call post-processing SP if provided
+        if username and original_name:
+            processed_name = original_name
+            if processed_name.lower().startswith('temp_'):
+                processed_name = processed_name[5:]
+            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
+            logging.info(f"Ejecutando dbo.sp_proc_ontime para Evidencias Pendientes usuario={username}, archivo={processed_name}")
+            db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
+            try:
+                sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+            except Exception:
+                sp2_af = None
+            logging.info(f"dbo.sp_proc_ontime (EvidenciasPendientes) @@ROWCOUNT={sp2_af}")
+
+        logging.info(f"EvidenciasPendientes: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        return processed_count
+    except Exception as e:
+        logging.error(f"Error procesando Evidencias Pendientes {file_path}: {e}")
+        raise
