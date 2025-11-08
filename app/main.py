@@ -218,6 +218,56 @@ async def generic_exception_handler(request: Request, exc: Exception):
     logging.error(f"Unhandled exception for request {request.url}: {tb}")
     return Response(status_code=500, content="Internal Server Error")
 
+
+# Endpoint para exponer el archivo de logs `api.log` como JSON
+@app.get("/logs/api-log")
+def get_api_log(limit: int = 1000, current_user: models.Usuario = Depends(get_current_user)):
+    """Return parsed lines from api.log as JSON list.
+
+    Each entry is an object with keys: 'fecha y hora', 'tipo', 'message'.
+    - 'limit' limits the number of returned log entries (default 1000).
+    """
+    try:
+        log_path = os.path.join(os.getcwd(), 'api.log')
+        if not os.path.exists(log_path):
+            raise HTTPException(status_code=404, detail=f"Log file not found: {log_path}")
+
+        ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})\s+([A-Z]+)\s+(.*)$")
+        entries = []
+        current = None
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as fh:
+            for line in fh:
+                line = line.rstrip('\n')
+                m = ts_re.match(line)
+                if m:
+                    # start of a new log record
+                    if current is not None:
+                        entries.append(current)
+                        if len(entries) >= limit:
+                            break
+                    current = {
+                        'fecha y hora': m.group(1),
+                        'tipo': m.group(2),
+                        'message': m.group(3)
+                    }
+                else:
+                    # continuation line (traceback or multi-line message)
+                    if current is not None:
+                        current['message'] = current.get('message', '') + '\n' + line
+                    else:
+                        # leading garbage lines - ignore
+                        continue
+
+        if current is not None and len(entries) < limit:
+            entries.append(current)
+
+        return entries
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error leyendo api.log: {e}")
+        raise HTTPException(status_code=500, detail="Error leyendo api.log")
+
 # --- Endpoints de autenticación ---
 @app.post("/token")
 def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
