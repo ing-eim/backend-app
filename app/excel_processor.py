@@ -357,16 +357,204 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                     logging.error(f"Error ejecutando dbo.sp_proc_ontime: {sp2_err}")
                     raise
 
-                # Commit once for the whole file (includes both SP calls)
+                # -- NEW: after processing OCT25, look for a PPTO sheet for current year (e.g. 'PPTO 25')
+                try:
+                    yy2 = str(_dt.now().year % 100).zfill(2)
+                    ppto_sheet = None
+                    with pd.ExcelFile(file_path) as xls:
+                        for s in xls.sheet_names:
+                            if re.match(rf'^PPTO\s*{yy2}$', str(s).strip(), re.IGNORECASE):
+                                ppto_sheet = s
+                                break
+
+                    if ppto_sheet:
+                        logging.info(f"Se encontró hoja PPTO: '{ppto_sheet}'. Comprobando bitácora antes de insertar en dbo.presupuesto_tmp")
+                        # Check mi_bitacora_operaciones for prior load of this sheet name
+                        try:
+                            cnt = db.execute(text("SELECT COUNT(1) FROM dbo.mi_bitacora_operaciones WHERE name_file_load = :sheetname"), {"sheetname": ppto_sheet}).scalar()
+
+                            logging.info(f"Bitácora operaciones: {cnt} registros encontrados para la hoja '{ppto_sheet}'")
+                        except Exception:
+                            cnt = None
+
+                        if cnt is not None and int(cnt) > 0:
+                            logging.info(f"La hoja '{ppto_sheet}' ya figura en dbo.mi_bitacora_operaciones (count={cnt}), se omite la carga de presupuesto.")
+                        else:
+                            # Read PPTO sheet and map to presupuesto_tmp
+                            try:
+                                df_p = pd.read_excel(file_path, sheet_name=ppto_sheet, header=0)
+                                logging.info(f"Reading presupuesto sheet '{ppto_sheet}' with header=0")
+                            except Exception as read_p_err:
+                                logging.error(f"No se pudo leer la hoja {ppto_sheet}: {read_p_err}")
+                                raise
+
+                            df_p = df_p.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
+                            df_p = df_p.where(pd.notnull(df_p), None)
+
+                            # Omitir filas donde la primera columna esté vacía
+                            if df_p.shape[1] > 0:
+                                first_col_p = df_p.columns[0]
+                                before_p = len(df_p)
+                                try:
+                                    non_empty_mask_p = df_p[first_col_p].notnull() & (df_p[first_col_p].astype(str).str.strip() != '')
+                                except Exception:
+                                    non_empty_mask_p = df_p[first_col_p].notnull()
+                                df_p = df_p[non_empty_mask_p]
+                                dropped_p = before_p - len(df_p)
+                                if dropped_p > 0:
+                                    logging.info(f"Presupuesto: omitidas {dropped_p} filas que iniciaban con campo vacío en columna '{first_col_p}'")
+
+                            records_p = df_p.to_dict(orient='records')
+
+                            insert_sql_p = (
+                                "INSERT INTO dbo.presupuesto_tmp (Mes, Anio, Venta_Anio_Anterior, Escenario_Pesimista, Escenario_Conservador, Escenario_Optimista, Usuario_Creacion, Fecha_Creacion) "
+                                "VALUES (:Mes, :Anio, :Venta_Anio_Anterior, :Escenario_Pesimista, :Escenario_Conservador, :Escenario_Optimista, :Usuario_Creacion, :Fecha_Creacion)"
+                            )
+
+                            # helper to coerce numeric to Decimal
+                            def _to_decimal(v):
+                                if v is None:
+                                    return None
+                                try:
+                                    if isinstance(v, (int, float, Decimal)):
+                                        d = Decimal(str(v))
+                                        return d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                                    s = re.sub(r"[^0-9.,\-]", "", str(v))
+                                    if s == '':
+                                        return None
+                                    if s.count(',') > 0 and s.count('.') == 0:
+                                        s = s.replace(',', '.')
+                                    elif s.count(',') > 0 and s.count('.') > 0:
+                                        if s.rfind('.') > s.rfind(','):
+                                            s = s.replace(',', '')
+                                        else:
+                                            s = s.replace('.', '').replace(',', '.')
+                                    d = Decimal(s)
+                                    return d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                                except Exception:
+                                    try:
+                                        return Decimal(str(float(str(v).replace(',', '.')))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                                    except Exception:
+                                        return None
+
+                            # Build normalized header map for scenario columns
+                            norm_map_p = {normalize_name(c): c for c in list(df_p.columns)}
+                            h_esc_pes = normalize_name('ESCENARIO PESIMISTA')
+                            h_esc_cons = normalize_name('ESCENARIO CONSERVADOR')
+                            h_esc_opt = normalize_name('ESCENARIO OPTIMISTA')
+
+                            total_inserted_p = 0
+                            current_year = _dt.now().year
+                            for idx_p, rec_p in enumerate(records_p, start=1):
+                                params_p = {
+                                    'Mes': None,
+                                    'Anio': current_year,
+                                    'Venta_Anio_Anterior': None,
+                                    'Escenario_Pesimista': None,
+                                    'Escenario_Conservador': None,
+                                    'Escenario_Optimista': None,
+                                    'Usuario_Creacion': username,
+                                    'Fecha_Creacion': None
+                                }
+
+                                # Mes from first physical column
+                                try:
+                                    mval = rec_p.get(first_col_p)
+                                except Exception:
+                                    mval = None
+                                if isinstance(mval, str):
+                                    mval = mval.replace('\xa0', ' ').strip()
+                                    if mval == '':
+                                        mval = None
+                                params_p['Mes'] = mval
+
+                                # Venta Año Anterior -> second column if present
+                                if df_p.shape[1] >= 2:
+                                    sec_col = df_p.columns[1]
+                                    v = rec_p.get(sec_col)
+                                    params_p['Venta_Anio_Anterior'] = _to_decimal(v)
+
+                                # Scenario columns by header name if present
+                                try:
+                                    if h_esc_pes in norm_map_p:
+                                        params_p['Escenario_Pesimista'] = _to_decimal(rec_p.get(norm_map_p[h_esc_pes]))
+                                except Exception:
+                                    params_p['Escenario_Pesimista'] = None
+                                try:
+                                    if h_esc_cons in norm_map_p:
+                                        params_p['Escenario_Conservador'] = _to_decimal(rec_p.get(norm_map_p[h_esc_cons]))
+                                except Exception:
+                                    params_p['Escenario_Conservador'] = None
+                                try:
+                                    if h_esc_opt in norm_map_p:
+                                        params_p['Escenario_Optimista'] = _to_decimal(rec_p.get(norm_map_p[h_esc_opt]))
+                                except Exception:
+                                    params_p['Escenario_Optimista'] = None
+
+                                # Log insert params for debugging
+                                try:
+                                    def _serialize_val(v):
+                                        if v is None:
+                                            return None
+                                        try:
+                                            if isinstance(v, _dt):
+                                                return v.isoformat()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            if isinstance(v, Decimal):
+                                                return str(v)
+                                        except Exception:
+                                            pass
+                                        return v
+
+                                    loggable_p = {k: _serialize_val(v) for k, v in params_p.items()}
+                                   # logging.info(f"Presupuesto insert fila {idx_p}: {loggable_p}")
+                                except Exception:
+                                    pass
+
+                                db.execute(text(insert_sql_p), params_p)
+                                try:
+                                    affected_p = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+                                except Exception:
+                                    affected_p = None
+                                try:
+                                    total_inserted_p += int(affected_p) if affected_p is not None else 0
+                                except Exception:
+                                    pass
+
+                            logging.info(f"Presupuesto: insertadas aprox {total_inserted_p} filas desde hoja '{ppto_sheet}'")
+
+                            # After inserting presupuesto rows, call sp_proc_ontime with sheet name as processed file
+                            try:
+                                sp_ppto_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
+                                logging.info(f"Ejecutando dbo.sp_proc_ontime para Presupuesto usuario={username}, hoja={ppto_sheet}")
+                                db.execute(text(sp_ppto_sql), {"nombre_usuario": username, "name_file_procesado": ppto_sheet})
+                                try:
+                                    sp_p_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+                                except Exception:
+                                    sp_p_af = None
+                                logging.info(f"dbo.sp_proc_ontime (Presupuesto) @@ROWCOUNT={sp_p_af}")
+                            except Exception as sp_p_err:
+                                logging.error(f"Error ejecutando sp_proc_ontime para Presupuesto: {sp_p_err}")
+                                raise
+
+                    else:
+                        logging.info(f"No se encontró hoja PPTO {yy2} en el libro; se omite carga de presupuesto.")
+                except Exception:
+                    # Any exception here should bubble up to outer handler to trigger rollback
+                    raise
+
+                # Commit once for the whole file (includes both SP calls and presupuesto inserts)
                 db.commit()
                 logging.info(f"Envío a SP completado. Enviadas: {len(records)}, total_affected_calc={total_affected}")
 
                 # Opción B: escribir archivo acumulado_<AAAA>.txt con el número de filas
-                try:
-                    _write_acumulado_file(file_path, name_only, len(records))
-                except Exception:
+                #try:
+                #    _write_acumulado_file(file_path, name_only, len(records))
+                #except Exception:
                     # _write_acumulado_file ya hace logging; no hacer fallar el flujo principal
-                    pass
+                 #   pass
 
             except Exception as sp_err:
                 # Rollback entire transaction on any failure
@@ -557,7 +745,7 @@ def process_incidencias(file_path: str, db: object, username: Optional[str] = No
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-                logging.info(f"PipelineComercial insert fila {idx}: {loggable}")
+                #logging.info(f"PipelineComercial insert fila {idx}: {loggable}")
             except Exception as log_ex:
                 logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
 
@@ -1143,7 +1331,7 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-                logging.info(f"PipelineComercial insert fila {idx}: {loggable}")
+                #logging.info(f"PipelineComercial insert fila {idx}: {loggable}")
             except Exception as log_ex:
                 logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
 
@@ -1434,7 +1622,7 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-                logging.info(f"Disponibilidad insert fila {idx}: {loggable}")
+                #logging.info(f"Disponibilidad insert fila {idx}: {loggable}")
             except Exception as log_ex:
                 logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
 
@@ -1637,7 +1825,7 @@ def process_factoraje(file_path: str, db: object, username: Optional[str] = None
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-                logging.info(f"Factoraje insert fila {idx}: {loggable}")
+                #logging.info(f"Factoraje insert fila {idx}: {loggable}")
             except Exception as log_ex:
                 logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
 
@@ -1840,7 +2028,7 @@ def process_relacion_pago(file_path: str, db: object, username: Optional[str] = 
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-                logging.info(f"Relacion Pago insert fila {idx}: {loggable}")
+               # logging.info(f"Relacion Pago insert fila {idx}: {loggable}")
             except Exception as log_ex:
                 logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
 
@@ -2097,7 +2285,7 @@ def process_venta_perdida(file_path: str, db: object, username: Optional[str] = 
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-                logging.info(f"VentaPerdida insert fila {idx}: {loggable}")
+              #  logging.info(f"VentaPerdida insert fila {idx}: {loggable}")
             except Exception:
                 pass
 
@@ -2329,7 +2517,7 @@ def process_evidencias_pendientes(file_path: str, db: object, username: Optional
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-                logging.info(f"EvidenciasPendientes insert fila {idx}: {loggable}")
+             #   logging.info(f"EvidenciasPendientes insert fila {idx}: {loggable}")
             except Exception:
                 pass
 
@@ -2361,4 +2549,250 @@ def process_evidencias_pendientes(file_path: str, db: object, username: Optional
         return processed_count
     except Exception as e:
         logging.error(f"Error procesando Evidencias Pendientes {file_path}: {e}")
+        raise
+
+
+def process_pronostico_cobranza(file_path: str, db: object, username: Optional[str] = None, original_name: Optional[str] = None) -> int:
+    """Process pronostico cobranza files into dbo.pronostico_cobranza_tmp.
+
+    Rules:
+    - Filename validation is done by the caller (endpoint). This function expects a saved temp file path and a DB session.
+    - Sheet name must be exactly 'TABLA NUEVA' (case-insensitive).
+    - Header row = 0. The column named CLIENTE is located and the following columns are treated as Semana columns.
+      Up to 13 Semana columns are mapped to Semana1..Semana13 (header string) and Total_SemanaX (the numeric value in row).
+    - If an explicit 'Total general' column exists, its numeric value is used for Total_General; otherwise Total_General is the sum of the available Total_SemanaX values.
+    - Inserts are executed row-by-row (no commit here). After inserts, if username and original_name are provided, executes dbo.sp_proc_ontime.
+
+    Returns number of rows processed.
+    """
+    logging.info(f"Procesando pronostico cobranza: {file_path}")
+    try:
+        # Find sheet named 'TABLA NUEVA'
+        sheet_to_use = None
+        with pd.ExcelFile(file_path) as xls:
+            for s in xls.sheet_names:
+                if s.strip().upper() == 'TABLA NUEVA':
+                    sheet_to_use = s
+                    break
+        if sheet_to_use is None:
+            raise ValueError("Hoja 'TABLA NUEVA' no encontrada en el archivo Excel")
+
+        try:
+            df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=0)
+            logging.info(f"Reading pronostico cobranza sheet '{sheet_to_use}' with header=0")
+        except Exception as read_err:
+            logging.error(f"No se pudo leer la hoja TABLA NUEVA: {read_err}")
+            raise
+
+        df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
+        df = df.where(pd.notnull(df), None)
+
+        # Normalize header keys
+        def nk(s: str) -> str:
+            if s is None:
+                return ''
+            ss = str(s).replace('\xa0', ' ')
+            ss = unicodedata.normalize('NFKD', ss)
+            ss = ''.join(c for c in ss if not unicodedata.combining(c))
+            return re.sub(r"\s+", " ", ss).strip().upper()
+
+        cols = list(df.columns)
+        normalized_map = {nk(c): c for c in cols}
+
+        # Prefer explicit CLIENTE header; otherwise use the first physical column as CLIENTE
+        if 'CLIENTE' in normalized_map:
+            cliente_col = normalized_map['CLIENTE']
+        else:
+            # map the first physical column to CLIENTE when the header is missing
+            cliente_col = cols[0]
+            logging.info(f"No se encontró columna 'CLIENTE' en TABLA NUEVA; usando primera columna '{cliente_col}' como CLIENTE")
+
+        cliente_index = cols.index(cliente_col)
+
+        # Week columns are the columns after the cliente column
+        week_cols = cols[cliente_index + 1:]
+        # Keep only non-empty header names
+        week_cols = [c for c in week_cols if c is not None and str(c).strip() != '']
+
+        records = df.to_dict(orient='records')
+        processed_count = len(records)
+
+        insert_sql = (
+            "INSERT INTO dbo.pronostico_cobranza_tmp (Cliente, Semana1, Total_Semana1, Semana2, Total_Semana2, Semana3, Total_Semana3, Semana4, Total_Semana4, Semana5, Total_Semana5, Semana6, Total_Semana6, Semana7, Total_Semana7, Semana8, Total_Semana8, Semana9, Total_Semana9, Semana10, Total_Semana10, Semana11, Total_Semana11, Semana12, Total_Semana12, Semana13, Total_Semana13, Total_General, Usuario_Creacion, Fecha_Creacion) "
+            "VALUES (:Cliente, :Semana1, :Total_Semana1, :Semana2, :Total_Semana2, :Semana3, :Total_Semana3, :Semana4, :Total_Semana4, :Semana5, :Total_Semana5, :Semana6, :Total_Semana6, :Semana7, :Total_Semana7, :Semana8, :Total_Semana8, :Semana9, :Total_Semana9, :Semana10, :Total_Semana10, :Semana11, :Total_Semana11, :Semana12, :Total_Semana12, :Semana13, :Total_Semana13, :Total_General, :Usuario_Creacion, :Fecha_Creacion)"
+        )
+
+        total_inserted = 0
+
+        # detect explicit Total general column if present
+        total_general_col = None
+        for k_norm, k in normalized_map.items():
+            if 'TOTAL' in k_norm and 'GENERAL' in k_norm:
+                total_general_col = k
+                break
+
+        for idx, rec in enumerate(records, start=1):
+            params = {
+                'Cliente': None,
+                'Semana1': None, 'Total_Semana1': None,
+                'Semana2': None, 'Total_Semana2': None,
+                'Semana3': None, 'Total_Semana3': None,
+                'Semana4': None, 'Total_Semana4': None,
+                'Semana5': None, 'Total_Semana5': None,
+                'Semana6': None, 'Total_Semana6': None,
+                'Semana7': None, 'Total_Semana7': None,
+                'Semana8': None, 'Total_Semana8': None,
+                'Semana9': None, 'Total_Semana9': None,
+                'Semana10': None, 'Total_Semana10': None,
+                'Semana11': None, 'Total_Semana11': None,
+                'Semana12': None, 'Total_Semana12': None,
+                'Semana13': None, 'Total_Semana13': None,
+                'Total_General': None,
+                'Usuario_Creacion': username,
+                'Fecha_Creacion': None
+            }
+
+            # Cliente
+            try:
+                cval = rec.get(cliente_col)
+            except Exception:
+                cval = None
+            if isinstance(cval, str):
+                cval = cval.replace('\xa0', ' ').strip()
+                if cval == '':
+                    cval = None
+            params['Cliente'] = cval
+
+            # Fill Semana headers and totals up to 13
+            sum_totals = Decimal('0')
+            any_total_present = False
+            for i in range(13):
+                header_name = None
+                cell_val = None
+                if i < len(week_cols):
+                    header_name = week_cols[i]
+                    try:
+                        cell_val = rec.get(week_cols[i])
+                    except Exception:
+                        cell_val = None
+
+                params[f'Semana{i+1}'] = None if header_name is None else str(header_name).strip()
+
+                # Coerce numeric amount for Total_SemanaX
+                if cell_val is None or (isinstance(cell_val, str) and cell_val.strip() == ''):
+                    params[f'Total_Semana{i+1}'] = None
+                else:
+                    try:
+                        s = re.sub(r"[^0-9.,\-]", "", str(cell_val))
+                        if s == '':
+                            params[f'Total_Semana{i+1}'] = None
+                        else:
+                            if s.count(',') > 0 and s.count('.') == 0:
+                                s = s.replace(',', '.')
+                            elif s.count(',') > 0 and s.count('.') > 0:
+                                if s.rfind('.') > s.rfind(','):
+                                    s = s.replace(',', '')
+                                else:
+                                    s = s.replace('.', '').replace(',', '.')
+                            d = Decimal(s)
+                            d = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                            params[f'Total_Semana{i+1}'] = d
+                            sum_totals += d
+                            any_total_present = True
+                    except Exception:
+                        try:
+                            params[f'Total_Semana{i+1}'] = Decimal(str(float(str(cell_val).replace(',', '.')))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                            sum_totals += params[f'Total_Semana{i+1}']
+                            any_total_present = True
+                        except Exception:
+                            params[f'Total_Semana{i+1}'] = None
+
+            # Total general: prefer explicit column, otherwise sum
+            if total_general_col is not None:
+                tg_val = None
+                try:
+                    tg_val = rec.get(total_general_col)
+                except Exception:
+                    tg_val = None
+                if tg_val is None or (isinstance(tg_val, str) and tg_val.strip() == ''):
+                    params['Total_General'] = None
+                else:
+                    try:
+                        s = re.sub(r"[^0-9.,\-]", "", str(tg_val))
+                        if s == '':
+                            params['Total_General'] = None
+                        else:
+                            if s.count(',') > 0 and s.count('.') == 0:
+                                s = s.replace(',', '.')
+                            elif s.count(',') > 0 and s.count('.') > 0:
+                                if s.rfind('.') > s.rfind(','):
+                                    s = s.replace(',', '')
+                                else:
+                                    s = s.replace('.', '').replace(',', '.')
+                            d = Decimal(s)
+                            params['Total_General'] = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                    except Exception:
+                        try:
+                            params['Total_General'] = Decimal(str(float(str(tg_val).replace(',', '.')))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            params['Total_General'] = None
+            else:
+                if any_total_present:
+                    params['Total_General'] = sum_totals.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                else:
+                    params['Total_General'] = None
+
+            # Fecha_Creacion: leave NULL (caller/DB can set) or set to current UTC
+            params['Fecha_Creacion'] = None
+
+            # Log params
+            try:
+                def _serialize_val(v):
+                    if v is None:
+                        return None
+                    try:
+                        if isinstance(v, _dt):
+                            return v.isoformat()
+                    except Exception:
+                        pass
+                    try:
+                        if isinstance(v, Decimal):
+                            return str(v)
+                    except Exception:
+                        pass
+                    return v
+
+                loggable = {k: _serialize_val(v) for k, v in params.items()}
+              #  logging.info(f"PronosticoCobranza insert fila {idx}: {loggable}")
+            except Exception:
+                pass
+
+            db.execute(text(insert_sql), params)
+            try:
+                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+            except Exception:
+                affected = None
+            try:
+                total_inserted += int(affected) if affected is not None else 0
+            except Exception:
+                pass
+
+        # After inserts, call post-processing SP if provided
+        if username and original_name:
+            processed_name = original_name
+            if processed_name.lower().startswith('temp_'):
+                processed_name = processed_name[5:]
+            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
+            logging.info(f"Ejecutando dbo.sp_proc_ontime para PronosticoCobranza usuario={username}, archivo={processed_name}")
+            db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
+            try:
+                sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+            except Exception:
+                sp2_af = None
+            logging.info(f"dbo.sp_proc_ontime (PronosticoCobranza) @@ROWCOUNT={sp2_af}")
+
+        logging.info(f"PronosticoCobranza: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        return processed_count
+    except Exception as e:
+        logging.error(f"Error procesando Pronostico Cobranza {file_path}: {e}")
         raise
