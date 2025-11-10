@@ -1201,7 +1201,12 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
 
                     if val is not None and norm_key in (nk('Semana'),):
                         try:
-                            val = int(float(str(val).replace(',', '.')))
+                            s = str(val)
+                            m = re.search(r'(\d+)', s)
+                            if m:
+                                val = int(m.group(1))
+                            else:
+                                val = None
                         except Exception:
                             val = None
 
@@ -1350,7 +1355,7 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
             processed_name = original_name
             if processed_name.lower().startswith('temp_'):
                 processed_name = processed_name[5:]
-            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
+            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado, 8"
             logging.info(f"Ejecutando dbo.sp_proc_ontime para pipeline comercial usuario={username}, archivo={processed_name}")
             db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
             try:
