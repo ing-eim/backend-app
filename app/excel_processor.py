@@ -870,41 +870,63 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
         if sheet_to_use is None:
             raise ValueError("Hoja que contiene 'Data_Historico' no encontrada en el archivo Excel")
 
+         # Expected headers (normalized) to map; we'll do fuzzy matching
+        expected = [
+            'Nombre de la LT', 'Fecha de Prospección', 'Semana', 'Fuente de Prospecto', 'Responsable',
+            'Fases Pipeline', 'Medio de Contacto', 'Fecha último contacto', 'Días Pipeline', 'Nombre de contacto',
+            'Número Telefono', 'Correo electrónico', 'Ubicación', 'Tipo de unidad', 'Capacidad instalada',
+            'Requisitos básicos de carga', 'Ruta estrategica', 'Cliente estrategico', 'Comentarios'
+        ]
+        
         # Attempt to auto-detect header row: prefer header=1 (so data starts on row 3),
         # but fall back to header=0 when header=1 looks invalid (many empty or duplicate column names).
         def _read_with_header_guess(path, sheet_name):
+            """More robust header detection:
+            - Read the first few rows with header=None
+            - For each candidate row (0..4) compute how many cells match expected normalized names
+            - Choose the row with the highest match count (if > 0) as header
+            - Otherwise fall back to header=0
+            """
             try:
-                df_try = pd.read_excel(path, sheet_name=sheet_name, header=1)
-                cols = list(df_try.columns)
-                # Clean header names to assess validity
-                cleaned = [None if c is None else str(c).strip() for c in cols]
-                empty_headers = sum(1 for c in cleaned if c is None or c == '')
-                duplicates = len(cleaned) != len(set(cleaned))
-                # If more than half of headers are empty or there are duplicates, treat as invalid
-                if len(cols) == 0:
-                    logging.getLogger('operations').info("Header detection: no columns found with header=1, falling back to header=0")
+                # preview first 10 rows without treating any as header
+                df_preview = pd.read_excel(path, sheet_name=sheet_name, header=None, nrows=10)
+                nrows = len(df_preview)
+
+                def _local_nk(x):
+                    if x is None:
+                        return ''
+                    s = str(x)
+                    s = s.replace('\xa0', ' ')
+                    s = unicodedata.normalize('NFKD', s)
+                    s = ''.join(c for c in s if not unicodedata.combining(c))
+                    return re.sub(r"\s+", " ", s).strip().upper()
+
+                exp_norms = { _local_nk(e) for e in expected }
+
+                best_row = None
+                best_score = -1
+                max_candidate = min(5, nrows)
+                for r in range(max_candidate):
+                    row_vals = df_preview.iloc[r].tolist()
+                    normed = [_local_nk(v) for v in row_vals]
+                    score = sum(1 for v in normed if v in exp_norms)
+                    if score > best_score:
+                        best_score = score
+                        best_row = r
+
+                if best_score is None or best_score <= 0:
+                    logging.getLogger('operations').info("Header detection: no good candidate found in preview; using header=0")
                     df0 = pd.read_excel(path, sheet_name=sheet_name, header=0)
                     return df0, 0
-                if empty_headers > (len(cols) / 2) or duplicates:
-                    logging.getLogger('operations').info(f"Header=1 appears invalid (empty_headers={empty_headers}, duplicates={duplicates}); falling back to header=0")
-                    df0 = pd.read_excel(path, sheet_name=sheet_name, header=0)
-                    return df0, 0
-                logging.getLogger('operations').info("Read with header=1 (data expected to start on row 3)")
-                return df_try, 1
+
+                # Read with detected header row
+                df_h = pd.read_excel(path, sheet_name=sheet_name, header=best_row)
+                logging.getLogger('operations').info(f"Read with detected header={best_row} (0-based); data expected to start after that row)")
+                return df_h, best_row
             except Exception as e:
-                logging.getLogger('operations').warning(f"Intento header=1 falló: {e}; intentando header=0")
+                logging.getLogger('operations').warning(f"Header-detection failed: {e}; falling back to header=0")
                 df0 = pd.read_excel(path, sheet_name=sheet_name, header=0)
                 return df0, 0
-
-        # Expected headers (human names) - define before header-guess so the heuristic can use them
-        expected = [
-            'No', 'Semana', 'Fuente de Prospecto', 'Cliente', 'Bloque de prospección', 'Tipo de cliente', 'ZONA GEOGRAFICA',
-            'Segmento', 'Clasificación de la oportunidad %', 'FUNNEL', 'Contacto', 'Correo Electronico', 'Telefono', 'Puesto',
-            'Fecha Contacto Inicial', 'Fecha Ultimo contacto', 'Evento Ultimo Contacto', 'Dias en Pipeline', 'Responsable de Seguimiento',
-            'Status', 'Producto a Transportar', 'Tipo de cliente (por su actividad)', 'Nombre de intermediario', 'Segmento',
-            'Proveedor Actual', 'Ubicación de Negociación', 'Proyecto Cross Selling / Quien Genero la oportunidad',
-            'IMPO', 'EXPO', 'NAC', 'DED', 'INTMDL', 'Mudanza', 'SPOT', 'CIRCUITO', 'PUERTOS', 'Origen', 'Destino', 'Bitacora de seguimiento'
-        ]
 
         def nk(s: str) -> str:
             if s is None:
@@ -914,8 +936,8 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
             ss = ''.join(c for c in ss if not unicodedata.combining(c))
             return re.sub(r"\s+", " ", ss).strip().upper()
 
-        normalized_expected_map = {nk(e): e for e in expected}
 
+        
         df, _used_header = _read_with_header_guess(file_path, sheet_to_use)
         df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
         df = df.where(pd.notnull(df), None)
@@ -937,23 +959,9 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
         records = df.to_dict(orient='records')
         processed_count = len(records)
 
-        # Expected headers (normalized) to map; we'll do fuzzy matching
-        expected = [
-            'NOMBRE DE LA LT', 'FECHA DE PROSPECCIÓN', 'SEMANA', 'FUENTE DE PROSPECTO', 'RESPONSABLE',
-            'FASES PIPELINE', 'MEDIO DE CONTACTO', 'FECHA ÚLTIMO CONTACTO', 'DÍAS PIPELINE', 'NOMBRE DE CONTACTO',
-            'NÚMERO TELEFONO', 'CORREO ELECTRÓNICO', 'UBICACIÓN', 'TIPO DE UNIDAD', 'CAPACIDAD INSTALADA',
-            'REQUISITOS BÁSICOS DE CARGA', 'RUTA ESTRATEGICA', 'CLIENTE ESTRATEGICO', 'COMENTARIOS'
-        ]
+       
 
-        def nk(s: str) -> str:
-            # Normalize string: remove accents, collapse whitespace, upper-case and replace non-breaking space
-            if s is None:
-                return ''
-            ss = str(s).replace('\xa0', ' ')
-            # remove accents
-            ss = unicodedata.normalize('NFKD', ss)
-            ss = ''.join(c for c in ss if not unicodedata.combining(c))
-            return re.sub(r"\s+", " ", ss).strip().upper()
+      
 
         normalized_key_map = {nk(k): k for k in list(df.columns)}
         # Normalize expected list so comparisons are accent-insensitive
@@ -967,6 +975,14 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
         )
 
         total_inserted = 0
+
+        # Build a mapping from expected (normalized) -> actual column name when present
+        matched_cols = {exp_norm: normalized_key_map.get(exp_norm) for exp_norm in normalized_expected_map.keys()}
+        #logging.getLogger('operations').info(f"PipelineTransporte normalized columns: {list(normalized_key_map.keys())}")
+        #logging.getLogger('operations').info(f"PipelineTransporte expected normalized keys: {list(normalized_expected_map.keys())}")
+        #
+        # logging.getLogger('operations').info(f"PipelineTransporte matched expected columns: { {k:v for k,v in matched_cols.items() if v is not None} }")
+
         for idx, rec in enumerate(records, start=1):
             params = {
                 'Nombre_LT': None, 'Fecha_Prospeccion': None, 'Semana': None, 'Fuente_Prospecto': None, 'Responsable': None,
@@ -975,106 +991,115 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
                 'Requisitos_Basicos_Carga': None, 'Ruta_Estrategica': None, 'Cliente_Estrategico': None, 'Comentarios': None, 'Usuario_Creacion': username
             }
 
-            for norm_key, col in normalized_key_map.items():
-                if norm_key in normalized_expected_map:
-                    # work with the normalized key (accent-free, upper-case)
-                    val = rec.get(col)
-                    # Normalize strings
-                    if isinstance(val, str):
-                        val = val.replace('\xa0', ' ').strip()
-                        if val == '':
-                            val = None
-                    # Dates coercion
-                    if val is not None and norm_key in ('FECHA DE PROSPECCION', 'FECHA ULTIMO CONTACTO'):
-                        try:
-                            if hasattr(val, 'to_pydatetime'):
-                                val = val.to_pydatetime()
-                            elif isinstance(val, _dt):
-                                pass
-                            else:
-                                # Try common parse orders: month-first then day-first
-                                parsed = pd.to_datetime(val, errors='coerce', dayfirst=False)
-                                if pd.isna(parsed):
-                                    parsed = pd.to_datetime(val, errors='coerce', dayfirst=True)
-                                if not pd.isna(parsed):
-                                    val = parsed.to_pydatetime()
-                                else:
-                                    logging.debug(f"No se pudo parsear fecha en fila {idx} columna {col}: {val}")
-                                    val = None
-                        except Exception:
-                            val = None
-                    # Numeric coercion for Semana, Dias, Capacidad
-                    if val is not None and norm_key == 'SEMANA':
-                        try:
-                            val = int(float(str(val).replace(',', '.')))
-                        except Exception:
-                            val = None
-                    if val is not None and norm_key == 'DIAS PIPELINE':
-                        try:
-                            val = int(float(str(val).replace(',', '.')))
-                        except Exception:
-                            val = None
-                    if val is not None and norm_key == 'CAPACIDAD INSTALADA':
-                        try:
-                            s = re.sub(r"[^0-9.,\-]", "", str(val))
-                            if s == '':
-                                val = None
-                            else:
-                                if s.count(',') > 0 and s.count('.') == 0:
-                                    s = s.replace(',', '.')
-                                elif s.count(',') > 0 and s.count('.') > 0:
-                                    if s.rfind('.') > s.rfind(','):
-                                        s = s.replace(',', '')
-                                    else:
-                                        s = s.replace('.', '').replace(',', '.')
-                                d = Decimal(s)
-                                val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                        except Exception:
-                            try:
-                                val = float(str(val).replace(',', '.'))
-                            except Exception:
-                                val = None
+            # Iterate over expected normalized keys (stable order) and extract value from actual column if present
+            for exp_norm, actual_col in matched_cols.items():
+                if actual_col is None:
+                    # no matching column in the sheet for this expected header
+                    continue
+                val = rec.get(actual_col)
+                # Normalize strings
+                if isinstance(val, str):
+                    val = val.replace('\xa0', ' ').strip()
+                    if val == '':
+                        val = None
 
-                    # Assign to params based on normalized expected name (accent-insensitive)
-                    # Use normalized keys without accents for matching
-                    if norm_key == nk('NOMBRE DE LA LT'):
-                        params['Nombre_LT'] = val
-                    elif norm_key == nk('FECHA DE PROSPECCIÓN'):
-                        params['Fecha_Prospeccion'] = val
-                    elif norm_key == nk('SEMANA'):
-                        params['Semana'] = val
-                    elif norm_key == nk('FUENTE DE PROSPECTO'):
-                        params['Fuente_Prospecto'] = val
-                    elif norm_key == nk('RESPONSABLE'):
-                        params['Responsable'] = val
-                    elif norm_key == nk('FASES PIPELINE'):
-                        params['Fases_Pipeline'] = val
-                    elif norm_key == nk('MEDIO DE CONTACTO'):
-                        params['Medio_Contacto'] = val
-                    elif norm_key == nk('FECHA ÚLTIMO CONTACTO'):
-                        params['Fecha_Ultimo_Contacto'] = val
-                    elif norm_key == nk('DÍAS PIPELINE'):
-                        params['Dias_Pipeline'] = val
-                    elif norm_key == nk('NOMBRE DE CONTACTO'):
-                        params['Nombre_Contacto'] = val
-                    elif norm_key == nk('NÚMERO TELEFONO'):
-                        params['Numero_Telefono'] = val
-                    elif norm_key == nk('CORREO ELECTRÓNICO'):
-                        params['Correo_Electronico'] = val
-                    elif norm_key == nk('UBICACIÓN'):
-                        params['Ubicacion'] = val
-                    elif norm_key == nk('TIPO DE UNIDAD'):
-                        params['Tipo_Unidad'] = val
-                    elif norm_key == nk('CAPACIDAD INSTALADA'):
-                        params['Capacidad_Instalada'] = val
-                    elif norm_key == nk('REQUISITOS BÁSICOS DE CARGA'):
-                        params['Requisitos_Basicos_Carga'] = val
-                    elif norm_key == nk('RUTA ESTRATEGICA'):
-                        params['Ruta_Estrategica'] = val
-                    elif norm_key == nk('CLIENTE ESTRATEGICO'):
-                        params['Cliente_Estrategico'] = val
-                    elif norm_key == nk('COMENTARIOS'):
-                        params['Comentarios'] = val
+                # Date coercion: use normalized keys for matching
+                if val is not None and exp_norm in {nk('Fecha de prospección'), nk('Fecha último contacto')}:
+                    try:
+                        if hasattr(val, 'to_pydatetime'):
+                            val = val.to_pydatetime()
+                        elif isinstance(val, _dt):
+                            pass
+                        else:
+                            parsed = pd.to_datetime(val, errors='coerce', dayfirst=False)
+                            if pd.isna(parsed):
+                                parsed = pd.to_datetime(val, errors='coerce', dayfirst=True)
+                            if not pd.isna(parsed):
+                                val = parsed.to_pydatetime()
+                            else:
+                                logging.getLogger('operations').debug(f"No se pudo parsear fecha en fila {idx} columna {actual_col}: {val}")
+                                val = None
+                    except Exception:
+                        val = None
+
+                # Numeric coercion for Semana, Dias, Capacidad
+                if val is not None and exp_norm == nk('Semana'):
+                    try:
+                        s = str(val)
+                        m = re.search(r'(\d+)', s)
+                        if m:
+                            val = int(m.group(1))
+                        else:
+                            val = None
+                    except Exception:
+                        val = None
+
+                if val is not None and exp_norm == nk('Días Pipeline'):
+                    try:
+                        val = int(float(str(val).replace(',', '.')))
+                    except Exception:
+                        val = None
+
+                if val is not None and exp_norm == nk('Capacidad instalada'):
+                    try:
+                        s = re.sub(r"[^0-9.,\-]", "", str(val))
+                        if s == '':
+                            val = None
+                        else:
+                            if s.count(',') > 0 and s.count('.') == 0:
+                                s = s.replace(',', '.')
+                            elif s.count(',') > 0 and s.count('.') > 0:
+                                if s.rfind('.') > s.rfind(','):
+                                    s = s.replace(',', '')
+                                else:
+                                    s = s.replace('.', '').replace(',', '.')
+                            d = Decimal(s)
+                            val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                    except Exception:
+                        try:
+                            val = float(str(val).replace(',', '.'))
+                        except Exception:
+                            val = None
+
+                # Assign to params based on expected normalized name
+                if exp_norm == nk('Nombre de la LT'):
+                    params['Nombre_LT'] = val
+                elif exp_norm == nk('Fecha de prospección'):
+                    params['Fecha_Prospeccion'] = val
+                elif exp_norm == nk('Semana'):
+                    params['Semana'] = val
+                elif exp_norm == nk('Fuente de prospecto'):
+                    params['Fuente_Prospecto'] = val
+                elif exp_norm == nk('Responsable'):
+                    params['Responsable'] = val
+                elif exp_norm == nk('Fases Pipeline'):
+                    params['Fases_Pipeline'] = val
+                elif exp_norm == nk('Medio de contacto'):
+                    params['Medio_Contacto'] = val
+                elif exp_norm == nk('Fecha último contacto'):
+                    params['Fecha_Ultimo_Contacto'] = val
+                elif exp_norm == nk('Días Pipeline'):
+                    params['Dias_Pipeline'] = val
+                elif exp_norm == nk('Nombre de contacto'):
+                    params['Nombre_Contacto'] = val
+                elif exp_norm == nk('Número Telefono'):
+                    params['Numero_Telefono'] = val
+                elif exp_norm == nk('Correo electrónico'):
+                    params['Correo_Electronico'] = val
+                elif exp_norm == nk('Ubicación'):
+                    params['Ubicacion'] = val
+                elif exp_norm == nk('Tipo de unidad'):
+                    params['Tipo_Unidad'] = val
+                elif exp_norm == nk('Capacidad instalada'):
+                    params['Capacidad_Instalada'] = val
+                elif exp_norm == nk('Requisitos básicos de carga'):
+                    params['Requisitos_Basicos_Carga'] = val
+                elif exp_norm == nk('Ruta estrategica'):
+                    params['Ruta_Estrategica'] = val
+                elif exp_norm == nk('Cliente estrategico'):
+                    params['Cliente_Estrategico'] = val
+                elif exp_norm == nk('Comentarios'):
+                    params['Comentarios'] = val
 
             # Execute insert
             db.execute(text(insert_sql), params)
@@ -1082,7 +1107,7 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
                 affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
             except Exception:
                 affected = None
-            logging.debug(f"Pipeline fila {idx} @@ROWCOUNT={affected}")
+            logging.getLogger('operations').debug(f"Pipeline fila {idx} @@ROWCOUNT={affected}")
             try:
                 total_inserted += int(affected) if affected is not None else 0
             except Exception:
