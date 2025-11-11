@@ -3,11 +3,57 @@ import re
 import unicodedata
 import pandas as pd
 import logging
+from app.logging_utils import SizeAndTimedRotatingFileHandler, ensure_logs_dir
 from typing import List, Dict, Optional
 from sqlalchemy import text
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime as _dt
 import re
+
+
+# --- Module logging: write excel_processor logs into logs/operations.log (rotated daily/size) ---
+try:
+    _logs_dir = ensure_logs_dir()
+
+    # Use a stable base filename for operations; rotation will create dated/numbered backups
+    _operations_base = os.path.join(_logs_dir, 'operations.log')
+
+    # Avoid adding multiple handlers if module is re-imported
+    _mod_logger = logging.getLogger(__name__)
+    if not any(getattr(h, 'baseFilename', None) and os.path.abspath(getattr(h, 'baseFilename')) == os.path.abspath(_operations_base) for h in _mod_logger.handlers):
+        _fmt = "%(asctime)s %(levelname)s %(message)s"
+
+        # Use milliseconds formatter like the rest of the app
+        class _MilliFormatter(logging.Formatter):
+            def formatTime(self, record, datefmt=None):
+                from datetime import datetime
+                ct = datetime.fromtimestamp(record.created)
+                s = ct.strftime("%Y-%m-%d %H:%M:%S")
+                ms = int(record.msecs)
+                return f"{s},{ms:03d}"
+
+        # Rotate daily at midnight and when size exceeds 10MB, keep 14 backups
+        _handler = SizeAndTimedRotatingFileHandler(_operations_base, when='midnight', backupCount=14, encoding='utf-8', maxBytes=10 * 1024 * 1024)
+        _handler.setLevel(logging.getLogger('operations').info)
+        _handler.setFormatter(_MilliFormatter(_fmt, datefmt="%Y-%m-%d %H:%M:%S"))
+        _mod_logger.addHandler(_handler)
+        _mod_logger.setLevel(logging.getLogger('operations').info)
+        _mod_logger.propagate = False
+
+    # Also ensure root logger has an api.log handler that rotates (only add if not present)
+    try:
+        _api_path = os.path.join(_logs_dir, 'api.log')
+        _root = logging.getLogger()
+        if not any(hasattr(h, 'baseFilename') and os.path.abspath(getattr(h, 'baseFilename')) == os.path.abspath(_api_path) for h in _root.handlers):
+            _api_handler = SizeAndTimedRotatingFileHandler(_api_path, when='midnight', backupCount=30, encoding='utf-8', maxBytes=10 * 1024 * 1024)
+            _api_handler.setLevel(logging.getLogger('operations').info)
+            _api_handler.setFormatter(_MilliFormatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+            _root.addHandler(_api_handler)
+    except Exception:
+        pass
+except Exception:
+    # If logging setup fails, continue without module-specific logging
+    logging.getLogger(__name__).warning("No se pudo configurar el logging específico para excel_processor")
 
 def process_excel(file_path: str, db: Optional[object] = None, username: Optional[str] = None) -> List[Dict]:
     """Process an Excel file and optionally send OnTime rows to a stored procedure.
@@ -20,25 +66,29 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
     Returns:
         List of record dicts parsed from the file.
     """
-    logging.info(f"Procesando archivo Excel: {file_path}")
+    logging.getLogger('operations').info(f"Procesando archivo Excel: {file_path}")
+    try:
+        logging.getLogger('operations').info(f"Procesando archivo Excel: {file_path}")
+    except Exception:
+        pass
     try:
         # Detectar si el archivo sigue la nomenclatura OnTime_acumulado_AAAA
         filename = os.path.basename(file_path)
-        logging.info(f"{filename}")
+        logging.getLogger('operations').info(f"{filename}")
 
         name_only, _ext = os.path.splitext( f"{filename}")
-        logging.info(f"{name_only}")
+        logging.getLogger('operations').info(f"{name_only}")
 
         is_ontime = bool(re.match(r"^temp_OnTime_acumulado_\d{4}$", name_only, re.IGNORECASE))
-        logging.info(f"is_ontime: {is_ontime}")
+        logging.getLogger('operations').info(f"is_ontime: {is_ontime}")
         if is_ontime:
-            logging.info(f"Archivo detectado como OnTime, leyendo hoja 'OCT25' desde fila 7, columna 1: {filename}")
+            logging.getLogger('operations').info(f"Archivo detectado como OnTime, leyendo hoja 'OCT25' desde fila 7, columna 1: {filename}")
             # Verificar que la hoja 'OCT25' exista (case-insensitive)
             # Use context manager to ensure the Excel file handle is closed promptly
             sheet_to_use = None
             with pd.ExcelFile(file_path) as xls:
                 for s in xls.sheet_names:
-                    # logging.info(f"HOJA {s}")
+                    # logging.getLogger('operations').info(f"HOJA {s}")
                     if s.upper() == 'OCT25':
                         sheet_to_use = s
                         break
@@ -51,10 +101,10 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
             # Recortamos todas las columnas después de la columna 79 y seguimos con la siguiente fila.
             # df.iloc uses 0-based indexing, por lo que usamos :79 para obtener las primeras 79 columnas.
             if df.shape[1] > 79:
-                logging.info(f"OnTime file has {df.shape[1]} columns; trimming to 79 columns")
+                logging.getLogger('operations').info(f"OnTime file has {df.shape[1]} columns; trimming to 79 columns")
                 df = df.iloc[:, :79]
             elif df.shape[1] < 79:
-                logging.warning(f"OnTime file {filename} tiene solo {df.shape[1]} columnas; se esperaban al menos 79")
+                logging.getLogger('operations').warning(f"OnTime file {filename} tiene solo {df.shape[1]} columnas; se esperaban al menos 79")
         else:
             df = pd.read_excel(file_path)
         # Omitir filas que inicien con un campo vacío o nulo (primera columna)
@@ -71,12 +121,12 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
             after_count = len(df)
             dropped = before_count - after_count
             if dropped > 0:
-                logging.info(f"Omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+                logging.getLogger('operations').info(f"Omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
 
         # Reemplaza NaN, inf y -inf por None para compatibilidad con JSON
         df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
         df = df.where(pd.notnull(df), None)
-        logging.info(f"Archivo procesado correctamente: {file_path}, filas: {len(df)}")
+        logging.getLogger('operations').info(f"Archivo procesado correctamente: {file_path}, filas: {len(df)}")
         records = df.to_dict(orient='records')
         # Keep a copy of original columns for mapping; we'll support fuzzy header matching
         original_columns = list(df.columns)
@@ -97,9 +147,9 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                 out_path = os.path.join(out_dir, f"acumulado_{year}.txt")
                 with open(out_path, 'w', encoding='utf-8') as fh:
                     fh.write(str(int(count)))
-                logging.info(f"Escribido acumulado: {out_path} con {count} filas")
+                logging.getLogger('operations').info(f"Escribido acumulado: {out_path} con {count} filas")
             except Exception as write_err:
-                logging.error(f"No se pudo escribir acumulado_{year}.txt: {write_err}")
+                logging.getLogger('operations').error(f"No se pudo escribir acumulado_{year}.txt: {write_err}")
 
         def normalize_name(s: str) -> str:
             if s is None:
@@ -202,7 +252,7 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                     db_user = db.execute(text("SELECT SUSER_SNAME()")).scalar()
                 except Exception:
                     db_user = None
-                logging.info(f"DB context: DB_NAME={db_name}, SUSER_SNAME={db_user}")
+                logging.getLogger('operations').info(f"DB context: DB_NAME={db_name}, SUSER_SNAME={db_user}")
             except Exception:
                 pass
             current_idx = None
@@ -343,18 +393,18 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                         processed_name = name_only
                         if processed_name.lower().startswith('temp_'):
                             processed_name = processed_name[5:]
-                        sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
-                        logging.info(f"Ejecutando dbo.sp_proc_ontime para usuario={username}, archivo={processed_name}")
+                        sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado,11"
+                        logging.getLogger('operations').info(f"Ejecutando procedure para usuario={username}, archivo={processed_name}")
                         db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
                         try:
                             sp2_affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
                         except Exception:
                             sp2_affected = None
-                        logging.info(f"dbo.sp_proc_ontime @@ROWCOUNT={sp2_affected}")
+                        logging.getLogger('operations').info(f"Procedure @@ROWCOUNT={sp2_affected}")
                     else:
-                        logging.info("No se proporcionó nombre de usuario; se omite la ejecución de dbo.sp_proc_ontime")
+                        logging.getLogger('operations').info("No se proporcionó nombre de usuario; se omite la ejecución de procedure")
                 except Exception as sp2_err:
-                    logging.error(f"Error ejecutando dbo.sp_proc_ontime: {sp2_err}")
+                    logging.getLogger('operations').error(f"Error ejecutando procedure: {sp2_err}")
                     raise
 
                 # -- NEW: after processing OCT25, look for a PPTO sheet for current year (e.g. 'PPTO 25')
@@ -368,24 +418,24 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                 break
 
                     if ppto_sheet:
-                        logging.info(f"Se encontró hoja PPTO: '{ppto_sheet}'. Comprobando bitácora antes de insertar en dbo.presupuesto_tmp")
+                        logging.getLogger('operations').info(f"Se encontró hoja PPTO: '{ppto_sheet}'. Comprobando bitácora antes de insertar en dbo.presupuesto_tmp")
                         # Check mi_bitacora_operaciones for prior load of this sheet name
                         try:
                             cnt = db.execute(text("SELECT COUNT(1) FROM dbo.mi_bitacora_operaciones WHERE name_file_load = :sheetname"), {"sheetname": ppto_sheet}).scalar()
 
-                            logging.info(f"Bitácora operaciones: {cnt} registros encontrados para la hoja '{ppto_sheet}'")
+                            logging.getLogger('operations').info(f"Bitácora operaciones: {cnt} registros encontrados para la hoja '{ppto_sheet}'")
                         except Exception:
                             cnt = None
 
                         if cnt is not None and int(cnt) > 0:
-                            logging.info(f"La hoja '{ppto_sheet}' ya figura en dbo.mi_bitacora_operaciones (count={cnt}), se omite la carga de presupuesto.")
+                            logging.getLogger('operations').info(f"La hoja '{ppto_sheet}' ya figura en dbo.mi_bitacora_operaciones (count={cnt}), se omite la carga de presupuesto.")
                         else:
                             # Read PPTO sheet and map to presupuesto_tmp
                             try:
                                 df_p = pd.read_excel(file_path, sheet_name=ppto_sheet, header=0)
-                                logging.info(f"Reading presupuesto sheet '{ppto_sheet}' with header=0")
+                                logging.getLogger('operations').info(f"Reading presupuesto sheet '{ppto_sheet}' with header=0")
                             except Exception as read_p_err:
-                                logging.error(f"No se pudo leer la hoja {ppto_sheet}: {read_p_err}")
+                                logging.getLogger('operations').error(f"No se pudo leer la hoja {ppto_sheet}: {read_p_err}")
                                 raise
 
                             df_p = df_p.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
@@ -402,7 +452,7 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                 df_p = df_p[non_empty_mask_p]
                                 dropped_p = before_p - len(df_p)
                                 if dropped_p > 0:
-                                    logging.info(f"Presupuesto: omitidas {dropped_p} filas que iniciaban con campo vacío en columna '{first_col_p}'")
+                                    logging.getLogger('operations').info(f"Presupuesto: omitidas {dropped_p} filas que iniciaban con campo vacío en columna '{first_col_p}'")
 
                             records_p = df_p.to_dict(orient='records')
 
@@ -509,7 +559,7 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                         return v
 
                                     loggable_p = {k: _serialize_val(v) for k, v in params_p.items()}
-                                   # logging.info(f"Presupuesto insert fila {idx_p}: {loggable_p}")
+                                   # logging.getLogger('operations').info(f"Presupuesto insert fila {idx_p}: {loggable_p}")
                                 except Exception:
                                     pass
 
@@ -523,31 +573,31 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                 except Exception:
                                     pass
 
-                            logging.info(f"Presupuesto: insertadas aprox {total_inserted_p} filas desde hoja '{ppto_sheet}'")
+                            logging.getLogger('operations').info(f"Presupuesto: insertadas aprox {total_inserted_p} filas desde hoja '{ppto_sheet}'")
 
                             # After inserting presupuesto rows, call sp_proc_ontime with sheet name as processed file
                             try:
-                                sp_ppto_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
-                                logging.info(f"Ejecutando dbo.sp_proc_ontime para Presupuesto usuario={username}, hoja={ppto_sheet}")
+                                sp_ppto_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado,14"
+                                logging.getLogger('operations').info(f"Ejecutando Procedure para Presupuesto usuario={username}, hoja={ppto_sheet}")
                                 db.execute(text(sp_ppto_sql), {"nombre_usuario": username, "name_file_procesado": ppto_sheet})
                                 try:
                                     sp_p_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
                                 except Exception:
                                     sp_p_af = None
-                                logging.info(f"dbo.sp_proc_ontime (Presupuesto) @@ROWCOUNT={sp_p_af}")
+                                logging.getLogger('operations').info(f"Procedure (Presupuesto) @@ROWCOUNT={sp_p_af}")
                             except Exception as sp_p_err:
-                                logging.error(f"Error ejecutando sp_proc_ontime para Presupuesto: {sp_p_err}")
+                                logging.getLogger('operations').error(f"Error ejecutando procedure para Presupuesto: {sp_p_err}")
                                 raise
 
                     else:
-                        logging.info(f"No se encontró hoja PPTO {yy2} en el libro; se omite carga de presupuesto.")
+                        logging.getLogger('operations').info(f"No se encontró hoja PPTO {yy2} en el libro; se omite carga de presupuesto.")
                 except Exception:
                     # Any exception here should bubble up to outer handler to trigger rollback
                     raise
 
                 # Commit once for the whole file (includes both SP calls and presupuesto inserts)
                 db.commit()
-                logging.info(f"Envío a SP completado. Enviadas: {len(records)}, total_affected_calc={total_affected}")
+                logging.getLogger('operations').info(f"Envío a SP completado. Enviadas: {len(records)}, total_affected_calc={total_affected}")
 
                 # Opción B: escribir archivo acumulado_<AAAA>.txt con el número de filas
                 #try:
@@ -570,7 +620,7 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                 except Exception:
                     failing_params = None
 
-                logging.error(f"Error ejecutando SP en fila {current_idx}: {sp_err} -- datos: {failing_params}")
+                logging.getLogger('operations').error(f"Error ejecutando SP en fila {current_idx}: {sp_err} -- datos: {failing_params}")
                 # Try to still write the acumulado file even if SP failed (option B)
                 try:
                     _write_acumulado_file(file_path, name_only, len(records))
@@ -582,7 +632,11 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
 
         return records
     except Exception as e:
-        logging.error(f"Error procesando archivo Excel {file_path}: {str(e)}")
+        logging.getLogger('operations').error(f"Error procesando archivo Excel {file_path}: {str(e)}")
+        try:
+            logging.getLogger('operations').error(f"Error procesando archivo Excel {file_path}: {str(e)}")
+        except Exception:
+            pass
         raise
 
 
@@ -591,7 +645,11 @@ def process_incidencias(file_path: str, db: object, username: Optional[str] = No
 
     Returns the number of rows inserted.
     """
-    logging.info(f"Procesando archivo de incidencias: {file_path}")
+    logging.getLogger('operations').info(f"Procesando archivo de incidencias: {file_path}")
+    try:
+        logging.getLogger('operations').info(f"Procesando archivo de incidencias: {file_path}")
+    except Exception:
+        pass
     try:
         # Read sheet (first sheet) and normalize
         df = pd.read_excel(file_path)
@@ -611,7 +669,7 @@ def process_incidencias(file_path: str, db: object, username: Optional[str] = No
             after_count = len(df)
             dropped = before_count - after_count
             if dropped > 0:
-                logging.info(f"Incidencias: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+                logging.getLogger('operations').info(f"Incidencias: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
 
         records = df.to_dict(orient='records')
         processed_count = len(records)
@@ -745,7 +803,7 @@ def process_incidencias(file_path: str, db: object, username: Optional[str] = No
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-                #logging.info(f"PipelineComercial insert fila {idx}: {loggable}")
+                #logging.getLogger('operations').info(f"PipelineComercial insert fila {idx}: {loggable}")
             except Exception as log_ex:
                 logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
 
@@ -765,19 +823,23 @@ def process_incidencias(file_path: str, db: object, username: Optional[str] = No
             processed_name = original_name
             if processed_name.lower().startswith('temp_'):
                 processed_name = processed_name[5:]
-            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
-            logging.info(f"Ejecutando dbo.sp_proc_ontime para incidencias usuario={username}, archivo={processed_name}")
+            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado,15"
+            logging.getLogger('operations').info(f"Ejecutando Procedure para incidencias usuario={username}, archivo={processed_name}")
             db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
             try:
                 sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
             except Exception:
                 sp2_af = None
-            logging.info(f"dbo.sp_proc_ontime (incidencias) @@ROWCOUNT={sp2_af}")
+            logging.getLogger('operations').info(f"Procedure (incidencias) @@ROWCOUNT={sp2_af}")
 
-        logging.info(f"Incidencias: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        logging.getLogger('operations').info(f"Incidencias: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
         return processed_count
     except Exception as e:
-        logging.error(f"Error procesando incidencias {file_path}: {e}")
+        logging.getLogger('operations').error(f"Error procesando incidencias {file_path}: {e}")
+        try:
+            logging.getLogger('operations').error(f"Error procesando incidencias {file_path}: {e}")
+        except Exception:
+            pass
         raise
 
 
@@ -792,7 +854,11 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
 
     Returns number of rows processed (omitting empty-first-column rows).
     """
-    logging.info(f"Procesando pipeline transporte: {file_path}")
+    logging.getLogger('operations').info(f"Procesando pipeline transporte: {file_path}")
+    try:
+        logging.getLogger('operations').info(f"Procesando pipeline transporte: {file_path}")
+    except Exception:
+        pass
     try:
         # Find sheet with Data_Historico
         sheet_to_use = None
@@ -816,17 +882,17 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
                 duplicates = len(cleaned) != len(set(cleaned))
                 # If more than half of headers are empty or there are duplicates, treat as invalid
                 if len(cols) == 0:
-                    logging.info("Header detection: no columns found with header=1, falling back to header=0")
+                    logging.getLogger('operations').info("Header detection: no columns found with header=1, falling back to header=0")
                     df0 = pd.read_excel(path, sheet_name=sheet_name, header=0)
                     return df0, 0
                 if empty_headers > (len(cols) / 2) or duplicates:
-                    logging.info(f"Header=1 appears invalid (empty_headers={empty_headers}, duplicates={duplicates}); falling back to header=0")
+                    logging.getLogger('operations').info(f"Header=1 appears invalid (empty_headers={empty_headers}, duplicates={duplicates}); falling back to header=0")
                     df0 = pd.read_excel(path, sheet_name=sheet_name, header=0)
                     return df0, 0
-                logging.info("Read with header=1 (data expected to start on row 3)")
+                logging.getLogger('operations').info("Read with header=1 (data expected to start on row 3)")
                 return df_try, 1
             except Exception as e:
-                logging.warning(f"Intento header=1 falló: {e}; intentando header=0")
+                logging.getLogger('operations').warning(f"Intento header=1 falló: {e}; intentando header=0")
                 df0 = pd.read_excel(path, sheet_name=sheet_name, header=0)
                 return df0, 0
 
@@ -866,7 +932,7 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
             after_count = len(df)
             dropped = before_count - after_count
             if dropped > 0:
-                logging.info(f"PipelineTransporte: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+                logging.getLogger('operations').info(f"PipelineTransporte: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
 
         records = df.to_dict(orient='records')
         processed_count = len(records)
@@ -1027,19 +1093,23 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
             processed_name = original_name
             if processed_name.lower().startswith('temp_'):
                 processed_name = processed_name[5:]
-            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
-            logging.info(f"Ejecutando dbo.sp_proc_ontime para pipeline usuario={username}, archivo={processed_name}")
+            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado,3"
+            logging.getLogger('operations').info(f"Ejecutando Procedure para pipeline usuario={username}, archivo={processed_name}")
             db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
             try:
                 sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
             except Exception:
                 sp2_af = None
-            logging.info(f"dbo.sp_proc_ontime (pipeline) @@ROWCOUNT={sp2_af}")
+            logging.getLogger('operations').info(f"Procedure (pipeline) @@ROWCOUNT={sp2_af}")
 
-        logging.info(f"PipelineTransporte: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        logging.getLogger('operations').info(f"PipelineTransporte: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
         return processed_count
     except Exception as e:
-        logging.error(f"Error procesando pipeline transporte {file_path}: {e}")
+        logging.getLogger('operations').error(f"Error procesando pipeline transporte {file_path}: {e}")
+        try:
+            logging.getLogger('operations').error(f"Error procesando pipeline transporte {file_path}: {e}")
+        except Exception:
+            pass
         raise
 
 
@@ -1053,7 +1123,11 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
 
     Returns number of rows processed (omitting rows whose first column is empty).
     """
-    logging.info(f"Procesando pipeline comercial: {file_path}")
+    logging.getLogger('operations').info(f"Procesando pipeline comercial: {file_path}")
+    try:
+        logging.getLogger('operations').info(f"Procesando pipeline comercial: {file_path}")
+    except Exception:
+        pass
     try:
         # Load workbook and pick sheet containing 'PIPELINE'
         sheet_to_use = None
@@ -1092,9 +1166,9 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
         try:
             # Read deterministically: headers are on Excel row 3 (header=2), so data starts on row 4.
             df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=2)
-            logging.info(f"Reading pipeline comercial sheet '{sheet_to_use}' with header=2 (headers on row 3, data starts on row 4)")
+            logging.getLogger('operations').info(f"Reading pipeline comercial sheet '{sheet_to_use}' with header=2 (headers on row 3, data starts on row 4)")
         except Exception as read_err:
-            logging.error(f"No se pudo leer sheet {sheet_to_use} con header=2: {read_err}")
+            logging.getLogger('operations').error(f"No se pudo leer sheet {sheet_to_use} con header=2: {read_err}")
             raise
 
         # If the first physical column is empty/placeholder, drop it so logical columns start at physical col 2
@@ -1102,11 +1176,11 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
             if df.shape[1] >= 2:
                 # Drop the first physical column because it's always empty per file convention.
                 df = df.iloc[:, 1:].copy()
-                logging.info(f"Dropped first physical column; columns now: {list(df.columns)}")
+                logging.getLogger('operations').info(f"Dropped first physical column; columns now: {list(df.columns)}")
             else:
-                logging.warning(f"Sheet {sheet_to_use} tiene menos de 2 columnas; no se eliminó la primera columna")
+                logging.getLogger('operations').warning(f"Sheet {sheet_to_use} tiene menos de 2 columnas; no se eliminó la primera columna")
         except Exception as drop_err:
-            logging.warning(f"No se pudo eliminar la primera columna física: {drop_err}")
+            logging.getLogger('operations').warning(f"No se pudo eliminar la primera columna física: {drop_err}")
 
         df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
         df = df.where(pd.notnull(df), None)
@@ -1124,7 +1198,7 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
             after_count = len(df)
             dropped = before_count - after_count
             if dropped > 0:
-                logging.info(f"PipelineComercial: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+                logging.getLogger('operations').info(f"PipelineComercial: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
 
         records = df.to_dict(orient='records')
         processed_count = len(records)
@@ -1336,7 +1410,7 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-                #logging.info(f"PipelineComercial insert fila {idx}: {loggable}")
+                #logging.getLogger('operations').info(f"PipelineComercial insert fila {idx}: {loggable}")
             except Exception as log_ex:
                 logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
 
@@ -1356,18 +1430,22 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
             if processed_name.lower().startswith('temp_'):
                 processed_name = processed_name[5:]
             sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado, 8"
-            logging.info(f"Ejecutando dbo.sp_proc_ontime para pipeline comercial usuario={username}, archivo={processed_name}")
+            logging.getLogger('operations').info(f"Ejecutando procedure para pipeline comercial usuario={username}, archivo={processed_name}")
             db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
             try:
                 sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
             except Exception:
                 sp2_af = None
-            logging.info(f"dbo.sp_proc_ontime (pipeline_comercial) @@ROWCOUNT={sp2_af}")
+            logging.getLogger('operations').info(f"Procedure (pipeline_comercial) @@ROWCOUNT={sp2_af}")
 
-        logging.info(f"PipelineComercial: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        logging.getLogger('operations').info(f"PipelineComercial: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
         return processed_count
     except Exception as e:
-        logging.error(f"Error procesando pipeline comercial {file_path}: {e}")
+        logging.getLogger('operations').error(f"Error procesando pipeline comercial {file_path}: {e}")
+        try:
+            logging.getLogger('operations').error(f"Error procesando pipeline comercial {file_path}: {e}")
+        except Exception:
+            pass
         raise
 
 
@@ -1388,7 +1466,11 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
 
     Returns number of rows inserted (omitting empty-first-column rows).
     """
-    logging.info(f"Procesando disponibilidad transporte: {file_path}")
+    logging.getLogger('operations').info(f"Procesando disponibilidad transporte: {file_path}")
+    try:
+        logging.getLogger('operations').info(f"Procesando disponibilidad transporte: {file_path}")
+    except Exception:
+        pass
     try:
         # Find OCT25 sheet
         sheet_to_use = None
@@ -1403,9 +1485,9 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
         # Read with header=0 (Excel row 1 is header) per validation request: header row = 1, first record = row 2
         try:
             df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=0)
-            logging.info(f"Reading disponibilidad sheet '{sheet_to_use}' with header=0 (headers on row 1)")
+            logging.getLogger('operations').info(f"Reading disponibilidad sheet '{sheet_to_use}' with header=0 (headers on row 1)")
         except Exception as read_err:
-            logging.error(f"No se pudo leer sheet {sheet_to_use} con header=0: {read_err}")
+            logging.getLogger('operations').error(f"No se pudo leer sheet {sheet_to_use} con header=0: {read_err}")
             raise
 
         # Helper to normalize strings (used by validation)
@@ -1449,7 +1531,7 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
             if total_checked > 0 and match_count > (len(cols) / 2):
                 raise ValueError("Se esperaba que la fila 1 contenga los encabezados y la fila 2 el primer registro; el archivo parece tener el encabezado en otra fila")
         except Exception as v_err:
-            logging.error(f"Validación de encabezado falló: {v_err}")
+            logging.getLogger('operations').error(f"Validación de encabezado falló: {v_err}")
             raise
 
         df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
@@ -1468,7 +1550,7 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
             after_count = len(df)
             dropped = before_count - after_count
             if dropped > 0:
-                logging.info(f"Disponibilidad: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+                logging.getLogger('operations').info(f"Disponibilidad: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
 
         records = df.to_dict(orient='records')
         processed_count = len(records)
@@ -1627,7 +1709,7 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-                #logging.info(f"Disponibilidad insert fila {idx}: {loggable}")
+                #logging.getLogger('operations').info(f"Disponibilidad insert fila {idx}: {loggable}")
             except Exception as log_ex:
                 logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
 
@@ -1646,19 +1728,23 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
             processed_name = original_name
             if processed_name.lower().startswith('temp_'):
                 processed_name = processed_name[5:]
-            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
-            logging.info(f"Ejecutando dbo.sp_proc_ontime para disponibilidad usuario={username}, archivo={processed_name}")
+            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado,13"
+            logging.getLogger('operations').info(f"Ejecutando Procedure para disponibilidad usuario={username}, archivo={processed_name}")
             db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
             try:
                 sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
             except Exception:
                 sp2_af = None
-            logging.info(f"dbo.sp_proc_ontime (disponibilidad) @@ROWCOUNT={sp2_af}")
+            logging.getLogger('operations').info(f"Procedure (disponibilidad) @@ROWCOUNT={sp2_af}")
 
-        logging.info(f"DisponibilidadTransporte: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        logging.getLogger('operations').info(f"DisponibilidadTransporte: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
         return processed_count
     except Exception as e:
-        logging.error(f"Error procesando disponibilidad transporte {file_path}: {e}")
+        logging.getLogger('operations').error(f"Error procesando disponibilidad transporte {file_path}: {e}")
+        try:
+            logging.getLogger('operations').error(f"Error procesando disponibilidad transporte {file_path}: {e}")
+        except Exception:
+            pass
         raise
 
 
@@ -1672,14 +1758,18 @@ def process_factoraje(file_path: str, db: object, username: Optional[str] = None
 
     Returns number of rows inserted (omitting empty-first-column rows).
     """
-    logging.info(f"Procesando factoraje: {file_path}")
+    logging.getLogger('operations').info(f"Procesando factoraje: {file_path}")
+    try:
+        logging.getLogger('operations').info(f"Procesando factoraje: {file_path}")
+    except Exception:
+        pass
     try:
         # Read first sheet with header=0
         try:
             df = pd.read_excel(file_path, sheet_name=0, header=0)
-            logging.info("Reading factoraje first sheet with header=0")
+            logging.getLogger('operations').info("Reading factoraje first sheet with header=0")
         except Exception as read_err:
-            logging.error(f"No se pudo leer la primera hoja: {read_err}")
+            logging.getLogger('operations').error(f"No se pudo leer la primera hoja: {read_err}")
             raise
 
         df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
@@ -1697,7 +1787,7 @@ def process_factoraje(file_path: str, db: object, username: Optional[str] = None
             after_count = len(df)
             dropped = before_count - after_count
             if dropped > 0:
-                logging.info(f"Factoraje: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+                logging.getLogger('operations').info(f"Factoraje: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
 
         records = df.to_dict(orient='records')
         processed_count = len(records)
@@ -1830,7 +1920,7 @@ def process_factoraje(file_path: str, db: object, username: Optional[str] = None
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-                #logging.info(f"Factoraje insert fila {idx}: {loggable}")
+                #logging.getLogger('operations').info(f"Factoraje insert fila {idx}: {loggable}")
             except Exception as log_ex:
                 logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
 
@@ -1849,19 +1939,23 @@ def process_factoraje(file_path: str, db: object, username: Optional[str] = None
             processed_name = original_name
             if processed_name.lower().startswith('temp_'):
                 processed_name = processed_name[5:]
-            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
-            logging.info(f"Ejecutando dbo.sp_proc_ontime para factoraje usuario={username}, archivo={processed_name}")
+            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado,1"
+            logging.getLogger('operations').info(f"Ejecutando Procedure para factoraje usuario={username}, archivo={processed_name}")
             db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
             try:
                 sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
             except Exception:
                 sp2_af = None
-            logging.info(f"dbo.sp_proc_ontime (factoraje) @@ROWCOUNT={sp2_af}")
+            logging.getLogger('operations').info(f"Procedure (factoraje) @@ROWCOUNT={sp2_af}")
 
-        logging.info(f"Factoraje: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        logging.getLogger('operations').info(f"Factoraje: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
         return processed_count
     except Exception as e:
-        logging.error(f"Error procesando factoraje {file_path}: {e}")
+        logging.getLogger('operations').error(f"Error procesando factoraje {file_path}: {e}")
+        try:
+            logging.getLogger('operations').error(f"Error procesando factoraje {file_path}: {e}")
+        except Exception:
+            pass
         raise
 
 
@@ -1875,14 +1969,18 @@ def process_relacion_pago(file_path: str, db: object, username: Optional[str] = 
 
     Returns number of rows inserted (omitting empty-first-column rows).
     """
-    logging.info(f"Procesando relacion_pago: {file_path}")
+    logging.getLogger('operations').info(f"Procesando relacion_pago: {file_path}")
+    try:
+        logging.getLogger('operations').info(f"Procesando relacion_pago: {file_path}")
+    except Exception:
+        pass
     try:
         # Read first sheet with header=0
         try:
             df = pd.read_excel(file_path, sheet_name=0, header=0)
-            logging.info("Reading relacion_pago first sheet with header=0")
+            logging.getLogger('operations').info("Reading relacion_pago first sheet with header=0")
         except Exception as read_err:
-            logging.error(f"No se pudo leer la primera hoja: {read_err}")
+            logging.getLogger('operations').error(f"No se pudo leer la primera hoja: {read_err}")
             raise
 
         df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
@@ -1900,7 +1998,7 @@ def process_relacion_pago(file_path: str, db: object, username: Optional[str] = 
             after_count = len(df)
             dropped = before_count - after_count
             if dropped > 0:
-                logging.info(f"Relacion Pago: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+                logging.getLogger('operations').info(f"Relacion Pago: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
 
         records = df.to_dict(orient='records')
         processed_count = len(records)
@@ -2033,7 +2131,7 @@ def process_relacion_pago(file_path: str, db: object, username: Optional[str] = 
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-               # logging.info(f"Relacion Pago insert fila {idx}: {loggable}")
+               # logging.getLogger('operations').info(f"Relacion Pago insert fila {idx}: {loggable}")
             except Exception as log_ex:
                 logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
 
@@ -2053,19 +2151,23 @@ def process_relacion_pago(file_path: str, db: object, username: Optional[str] = 
                 processed_name = original_name
                 if processed_name.lower().startswith('temp_'):
                     processed_name = processed_name[5:]
-                sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
-                logging.info(f"Ejecutando dbo.sp_proc_ontime para Relacion Pago usuario={username}, archivo={processed_name}")
+                sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado,2"
+                logging.getLogger('operations').info(f"Ejecutando Procedure para Relacion Pago usuario={username}, archivo={processed_name}")
                 db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
                 try:
                     sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
                 except Exception:
                     sp2_af = None
-                logging.info(f"dbo.sp_proc_ontime (Relacion Pago) @@ROWCOUNT={sp2_af}")
+                logging.getLogger('operations').info(f"Procedure (Relacion Pago) @@ROWCOUNT={sp2_af}")
 
-        logging.info(f"Relacion Pago: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        logging.getLogger('operations').info(f"Relacion Pago: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
         return processed_count
     except Exception as e:
-        logging.error(f"Error procesando Relacion Pago {file_path}: {e}")
+        logging.getLogger('operations').error(f"Error procesando Relacion Pago {file_path}: {e}")
+        try:
+            logging.getLogger('operations').error(f"Error procesando Relacion Pago {file_path}: {e}")
+        except Exception:
+            pass
         raise
 
 
@@ -2079,8 +2181,12 @@ def process_venta_perdida(file_path: str, db: object, username: Optional[str] = 
 
     Returns number of rows processed.
     """
-    logging.info(f"Procesando venta perdida: {file_path}")
+    logging.getLogger('operations').info(f"Procesando venta perdida: {file_path}")
     try:
+        try:
+            logging.getLogger('operations').info(f"Procesando venta perdida: {file_path}")
+        except Exception:
+            pass
         # Determine sheet name: prefer year from original_name
         sheet_to_use = None
         year_from_name = None
@@ -2101,9 +2207,9 @@ def process_venta_perdida(file_path: str, db: object, username: Optional[str] = 
 
         try:
             df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=0)
-            logging.info(f"Reading venta perdida sheet '{sheet_to_use}' with header=0")
+            logging.getLogger('operations').info(f"Reading venta perdida sheet '{sheet_to_use}' with header=0")
         except Exception as read_err:
-            logging.error(f"No se pudo leer la hoja {sheet_to_use}: {read_err}")
+            logging.getLogger('operations').error(f"No se pudo leer la hoja {sheet_to_use}: {read_err}")
             raise
 
         df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
@@ -2121,7 +2227,7 @@ def process_venta_perdida(file_path: str, db: object, username: Optional[str] = 
             after_count = len(df)
             dropped = before_count - after_count
             if dropped > 0:
-                logging.info(f"VentaPerdida: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+                logging.getLogger('operations').info(f"VentaPerdida: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
 
         records = df.to_dict(orient='records')
         processed_count = len(records)
@@ -2290,7 +2396,7 @@ def process_venta_perdida(file_path: str, db: object, username: Optional[str] = 
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-              #  logging.info(f"VentaPerdida insert fila {idx}: {loggable}")
+              #  logging.getLogger('operations').info(f"VentaPerdida insert fila {idx}: {loggable}")
             except Exception:
                 pass
 
@@ -2309,19 +2415,23 @@ def process_venta_perdida(file_path: str, db: object, username: Optional[str] = 
             processed_name = original_name
             if processed_name.lower().startswith('temp_'):
                 processed_name = processed_name[5:]
-            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
-            logging.info(f"Ejecutando dbo.sp_proc_ontime para VentaPerdida usuario={username}, archivo={processed_name}")
+            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado,12"
+            logging.getLogger('operations').info(f"Ejecutando Procedure para VentaPerdida usuario={username}, archivo={processed_name}")
             db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
             try:
                 sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
             except Exception:
                 sp2_af = None
-            logging.info(f"dbo.sp_proc_ontime (VentaPerdida) @@ROWCOUNT={sp2_af}")
+            logging.getLogger('operations').info(f"Procedure (VentaPerdida) @@ROWCOUNT={sp2_af}")
 
-        logging.info(f"VentaPerdida: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        logging.getLogger('operations').info(f"VentaPerdida: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
         return processed_count
     except Exception as e:
-        logging.error(f"Error procesando Venta Perdida {file_path}: {e}")
+        logging.getLogger('operations').error(f"Error procesando Venta Perdida {file_path}: {e}")
+        try:
+            logging.getLogger('operations').error(f"Error procesando Venta Perdida {file_path}: {e}")
+        except Exception:
+            pass
         raise
 
 
@@ -2337,8 +2447,12 @@ def process_evidencias_pendientes(file_path: str, db: object, username: Optional
 
     Returns number of rows processed.
     """
-    logging.info(f"Procesando evidencias_pendientes: {file_path}")
+    logging.getLogger('operations').info(f"Procesando evidencias_pendientes: {file_path}")
     try:
+        try:
+            logging.getLogger('operations').info(f"Procesando evidencias_pendientes: {file_path}")
+        except Exception:
+            pass
         # Find sheet named 'TABLA'
         sheet_to_use = None
         with pd.ExcelFile(file_path) as xls:
@@ -2351,9 +2465,9 @@ def process_evidencias_pendientes(file_path: str, db: object, username: Optional
 
         try:
             df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=0)
-            logging.info(f"Reading evidencias_pendientes sheet '{sheet_to_use}' with header=0")
+            logging.getLogger('operations').info(f"Reading evidencias_pendientes sheet '{sheet_to_use}' with header=0")
         except Exception as read_err:
-            logging.error(f"No se pudo leer la hoja TABLA: {read_err}")
+            logging.getLogger('operations').error(f"No se pudo leer la hoja TABLA: {read_err}")
             raise
 
         df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
@@ -2522,7 +2636,7 @@ def process_evidencias_pendientes(file_path: str, db: object, username: Optional
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-             #   logging.info(f"EvidenciasPendientes insert fila {idx}: {loggable}")
+             #   logging.getLogger('operations').info(f"EvidenciasPendientes insert fila {idx}: {loggable}")
             except Exception:
                 pass
 
@@ -2541,19 +2655,23 @@ def process_evidencias_pendientes(file_path: str, db: object, username: Optional
             processed_name = original_name
             if processed_name.lower().startswith('temp_'):
                 processed_name = processed_name[5:]
-            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
-            logging.info(f"Ejecutando dbo.sp_proc_ontime para Evidencias Pendientes usuario={username}, archivo={processed_name}")
+            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado,5"
+            logging.getLogger('operations').info(f"Ejecutando Procedure para Evidencias Pendientes usuario={username}, archivo={processed_name}")
             db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
             try:
                 sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
             except Exception:
                 sp2_af = None
-            logging.info(f"dbo.sp_proc_ontime (EvidenciasPendientes) @@ROWCOUNT={sp2_af}")
+            logging.getLogger('operations').info(f"Procedure (EvidenciasPendientes) @@ROWCOUNT={sp2_af}")
 
-        logging.info(f"EvidenciasPendientes: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        logging.getLogger('operations').info(f"EvidenciasPendientes: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
         return processed_count
     except Exception as e:
-        logging.error(f"Error procesando Evidencias Pendientes {file_path}: {e}")
+        logging.getLogger('operations').error(f"Error procesando Evidencias Pendientes {file_path}: {e}")
+        try:
+            logging.getLogger('operations').error(f"Error procesando Evidencias Pendientes {file_path}: {e}")
+        except Exception:
+            pass
         raise
 
 
@@ -2570,8 +2688,12 @@ def process_pronostico_cobranza(file_path: str, db: object, username: Optional[s
 
     Returns number of rows processed.
     """
-    logging.info(f"Procesando pronostico cobranza: {file_path}")
+    logging.getLogger('operations').info(f"Procesando pronostico cobranza: {file_path}")
     try:
+        try:
+            logging.getLogger('operations').info(f"Procesando pronostico cobranza: {file_path}")
+        except Exception:
+            pass
         # Find sheet named 'TABLA NUEVA'
         sheet_to_use = None
         with pd.ExcelFile(file_path) as xls:
@@ -2584,9 +2706,9 @@ def process_pronostico_cobranza(file_path: str, db: object, username: Optional[s
 
         try:
             df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=0)
-            logging.info(f"Reading pronostico cobranza sheet '{sheet_to_use}' with header=0")
+            logging.getLogger('operations').info(f"Reading pronostico cobranza sheet '{sheet_to_use}' with header=0")
         except Exception as read_err:
-            logging.error(f"No se pudo leer la hoja TABLA NUEVA: {read_err}")
+            logging.getLogger('operations').error(f"No se pudo leer la hoja TABLA NUEVA: {read_err}")
             raise
 
         df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
@@ -2610,7 +2732,7 @@ def process_pronostico_cobranza(file_path: str, db: object, username: Optional[s
         else:
             # map the first physical column to CLIENTE when the header is missing
             cliente_col = cols[0]
-            logging.info(f"No se encontró columna 'CLIENTE' en TABLA NUEVA; usando primera columna '{cliente_col}' como CLIENTE")
+            logging.getLogger('operations').info(f"No se encontró columna 'CLIENTE' en TABLA NUEVA; usando primera columna '{cliente_col}' como CLIENTE")
 
         cliente_index = cols.index(cliente_col)
 
@@ -2768,7 +2890,7 @@ def process_pronostico_cobranza(file_path: str, db: object, username: Optional[s
                     return v
 
                 loggable = {k: _serialize_val(v) for k, v in params.items()}
-              #  logging.info(f"PronosticoCobranza insert fila {idx}: {loggable}")
+              #  logging.getLogger('operations').info(f"PronosticoCobranza insert fila {idx}: {loggable}")
             except Exception:
                 pass
 
@@ -2787,17 +2909,21 @@ def process_pronostico_cobranza(file_path: str, db: object, username: Optional[s
             processed_name = original_name
             if processed_name.lower().startswith('temp_'):
                 processed_name = processed_name[5:]
-            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado"
-            logging.info(f"Ejecutando dbo.sp_proc_ontime para PronosticoCobranza usuario={username}, archivo={processed_name}")
+            sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado,6"
+            logging.getLogger('operations').info(f"Ejecutando Procedure para PronosticoCobranza usuario={username}, archivo={processed_name}")
             db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
             try:
                 sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
             except Exception:
                 sp2_af = None
-            logging.info(f"dbo.sp_proc_ontime (PronosticoCobranza) @@ROWCOUNT={sp2_af}")
+            logging.getLogger('operations').info(f"Procedure (PronosticoCobranza) @@ROWCOUNT={sp2_af}")
 
-        logging.info(f"PronosticoCobranza: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        logging.getLogger('operations').info(f"PronosticoCobranza: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
         return processed_count
     except Exception as e:
-        logging.error(f"Error procesando Pronostico Cobranza {file_path}: {e}")
+        logging.getLogger('operations').error(f"Error procesando Pronostico Cobranza {file_path}: {e}")
+        try:
+            logging.getLogger('operations').error(f"Error procesando Pronostico Cobranza {file_path}: {e}")
+        except Exception:
+            pass
         raise

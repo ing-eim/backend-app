@@ -16,12 +16,57 @@ from fastapi.encoders import jsonable_encoder
 from jose import JWTError, jwt
 import re
 
-logging.basicConfig(
-    filename="api.log",
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    encoding="utf-8"
-)
+# Ensure logs directory exists and configure root logger to write application logs
+from app.logging_utils import SizeAndTimedRotatingFileHandler, ensure_logs_dir
+logs_dir = ensure_logs_dir()
+api_log_path = os.path.join(logs_dir, 'api.log')
+
+# Configure root logger with a handler that rotates daily and also by size (10MB)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+# Remove any existing handlers to avoid duplicate logging when reloading
+for h in list(root_logger.handlers):
+    try:
+        root_logger.removeHandler(h)
+    except Exception:
+        pass
+
+# Timed (midnight) + size rotation (maxBytes)
+api_handler = SizeAndTimedRotatingFileHandler(api_log_path, when='midnight', backupCount=30, encoding='utf-8', maxBytes=10 * 1024 * 1024)
+api_formatter = logging.Formatter("%(asctime)s,%(msecs)03d %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+api_handler.setFormatter(api_formatter)
+api_handler.setLevel(logging.INFO)
+root_logger.addHandler(api_handler)
+
+# Also keep a console handler for convenience in dev
+console_h = logging.StreamHandler()
+console_h.setLevel(logging.INFO)
+console_h.setFormatter(api_formatter)
+root_logger.addHandler(console_h)
+
+logging.getLogger().info(f"Root logging initialized, api.log -> {api_log_path}")
+
+# --- operations.log handler: create a dedicated 'operations' logger and attach the operations handler ---
+try:
+    operations_path = os.path.join(logs_dir, 'operations.log')
+    # Only add if not already added to root handlers
+    if not any(getattr(h, 'baseFilename', None) and os.path.abspath(getattr(h, 'baseFilename')) == os.path.abspath(operations_path) for h in logging.root.handlers):
+        ops_handler = SizeAndTimedRotatingFileHandler(operations_path, when='midnight', backupCount=14, encoding='utf-8', maxBytes=10 * 1024 * 1024)
+        ops_handler.setLevel(logging.INFO)
+        ops_handler.setFormatter(api_formatter)
+
+        # Create a dedicated logger named 'operations'. Calls to logging.getLogger('operations') will
+        # write into operations.log. Keep propagate=False to avoid duplicating into api.log.
+        ops_logger = logging.getLogger('operations')
+        ops_logger.setLevel(logging.INFO)
+        ops_logger.addHandler(ops_handler)
+        ops_logger.propagate = False
+        logging.getLogger().info(f"Operations logging initialized, operations.log -> {operations_path}")
+except Exception:
+    logging.getLogger().warning("No se pudo configurar operations.log handler")
+
+# Ensure ops_logger exists even if the above handler creation failed so calls below won't NameError
+ops_logger = logging.getLogger('operations')
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -97,11 +142,11 @@ async def procesar_excel(file: UploadFile = File(...), current_user: models.Usua
     name_only, _ext = os.path.splitext(filename)
     m = re.match(r"^OnTime_acumulado_(\d{4})$", name_only)
     if not m:
-        logging.warning(f"Archivo con nombre inválido recibido: {filename}")
+        ops_logger.warning(f"Archivo con nombre inválido recibido: {filename}")
         raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'OnTime_acumulado_AAAA'")
     year = int(m.group(1))
     if year < 2000 or year > 2100:
-        logging.warning(f"Archivo con año inválido en el nombre: {filename}")
+        ops_logger.warning(f"Archivo con año inválido en el nombre: {filename}")
         raise HTTPException(status_code=400, detail="El año en el nombre del archivo no es válido")
 
     # Antes de procesar, verificar en dbo.mi_bitacora_operaciones que el archivo no haya sido procesado
@@ -124,19 +169,19 @@ async def procesar_excel(file: UploadFile = File(...), current_user: models.Usua
                     except Exception:
                         proc_fecha_str = str(proc_fecha)
                     msg = f"El archivo ya fue procesado por {proc_user} el {proc_fecha_str}"
-                    logging.info(f"Archivo {filename} ya procesado: {msg}")
+                    ops_logger.info(f"Archivo {filename} ya procesado: {msg}")
                     raise HTTPException(status_code=400, detail=msg)
             except HTTPException:
                 raise
             except Exception as e:
                 # Si la comprobación falla por algún motivo, registrarlo y continuar con el procesamiento
-                logging.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
+                ops_logger.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
     except Exception as e:
         # If the inner check raised an HTTPException (file already processed), re-raise it so the endpoint returns 400.
         if isinstance(e, HTTPException):
             raise
         # Otherwise log and continue (verification couldn't be performed)
-        logging.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
+        ops_logger.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
 
     try:
         file_location = f"temp_{file.filename}"
@@ -151,16 +196,21 @@ async def procesar_excel(file: UploadFile = File(...), current_user: models.Usua
             with SessionLocal() as db:
                 try:
                     # Pass the logged-in user's nombre_usuario so the processor can call dbo.sp_proc_ontime
+                    try:
+                        ops_logger.info(f"Procesando OnTime archivo={name_only} usuario={current_user.nombre_usuario}")
+                    except Exception:
+                        # Ensure logging does not break processing if ops_logger misconfigured
+                        pass
                     data = process_excel(file_location, db=db, username=current_user.nombre_usuario)
                 except Exception as pe_err:
                     # Log full traceback and return a concise error to the caller
                     tb = traceback.format_exc()
-                    logging.error(f"Error procesando OnTime y ejecutando SP: {pe_err}\n{tb}")
+                    ops_logger.error(f"Error procesando OnTime y ejecutando SP: {pe_err}\n{tb}")
                     # Clean up temp file before returning
                     try:
                         safe_remove(file_location)
                     except Exception as rm_err:
-                        logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
+                        ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
                     return JSONResponse(status_code=500, content={"rows_read": 0, "error": "Error al procesar archivo OnTime; verificar api.log"})
         except Exception:
             # If DB session cannot be opened or process_excel raised before using DB, try fallback processing without DB
@@ -168,11 +218,11 @@ async def procesar_excel(file: UploadFile = File(...), current_user: models.Usua
                 data = process_excel(file_location)
             except Exception as fallback_err:
                 tb = traceback.format_exc()
-                logging.error(f"Error en procesamiento fallback del archivo: {fallback_err}\n{tb}")
+                ops_logger.error(f"Error en procesamiento fallback del archivo: {fallback_err}\n{tb}")
                 try:
                     safe_remove(file_location)
                 except Exception as rm_err:
-                    logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
+                    ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
                 return JSONResponse(status_code=500, content={"rows_read": 0, "error": "Error al procesar archivo; verificar api.log"})
 
         # Guardar resultados leídos en archivo .txt: acumulado_<AAAA>.txt
@@ -183,7 +233,7 @@ async def procesar_excel(file: UploadFile = File(...), current_user: models.Usua
                     safe_row = jsonable_encoder(row)
                     out_f.write(json.dumps(safe_row, ensure_ascii=False) + "\n")
         except Exception as wf_err:
-            logging.error(f"Error escribiendo archivo de salida {out_filename}: {wf_err}")
+            ops_logger.error(f"Error escribiendo archivo de salida {out_filename}: {wf_err}")
             # attempt to remove temp file
             try:
                 safe_remove(file_location)
@@ -197,14 +247,14 @@ async def procesar_excel(file: UploadFile = File(...), current_user: models.Usua
         try:
             safe_remove(file_location)
         except Exception as del_err:
-            logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
+            ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
 
         # Retornar sólo el número de registros leídos
         return {"rows_read": rows_count}
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"Error procesando archivo {file.filename}: {e}")
+        ops_logger.error(f"Error procesando archivo {file.filename}: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 
 # Dependency
@@ -228,7 +278,7 @@ def get_api_log(limit: int = 1000, current_user: models.Usuario = Depends(get_cu
     - 'limit' limits the number of returned log entries (default 1000).
     """
     try:
-        log_path = os.path.join(os.getcwd(), 'api.log')
+        log_path = os.path.join(os.getcwd(), 'logs/operations.log')
         if not os.path.exists(log_path):
             raise HTTPException(status_code=404, detail=f"Log file not found: {log_path}")
 
@@ -424,12 +474,12 @@ async def procesar_incidencias(file: UploadFile = File(...), current_user: model
     name_only, _ext = os.path.splitext(filename)
     m = re.match(r"^incidencias_(\d{2})-(\d{4})$", name_only, re.IGNORECASE)
     if not m:
-        logging.warning(f"Archivo de incidencias con nombre inválido recibido: {filename}")
+        ops_logger.warning(f"Archivo de incidencias con nombre inválido recibido: {filename}")
         raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'incidencias_MM-AAAA'")
     month = int(m.group(1))
     year = int(m.group(2))
     if month < 1 or month > 12 or year < 2000 or year > 2100:
-        logging.warning(f"Archivo de incidencias con mes/año inválido en el nombre: {filename}")
+        ops_logger.warning(f"Archivo de incidencias con mes/año inválido en el nombre: {filename}")
         raise HTTPException(status_code=400, detail="El mes o año en el nombre del archivo no es válido")
 
     # Verificar en mi_bitacora_operaciones si ya fue procesado
@@ -450,16 +500,16 @@ async def procesar_incidencias(file: UploadFile = File(...), current_user: model
                     except Exception:
                         proc_fecha_str = str(proc_fecha)
                     msg = f"El archivo ya fue procesado por {proc_user} el {proc_fecha_str}"
-                    logging.info(f"Archivo {filename} ya procesado: {msg}")
+                    ops_logger.info(f"Archivo {filename} ya procesado: {msg}")
                     raise HTTPException(status_code=400, detail=msg)
             except HTTPException:
                 raise
             except Exception as e:
-                logging.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
+                ops_logger.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
     except Exception as e:
         if isinstance(e, HTTPException):
             raise
-        logging.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
+        ops_logger.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
 
     try:
         file_location = f"temp_{file.filename}"
@@ -471,12 +521,16 @@ async def procesar_incidencias(file: UploadFile = File(...), current_user: model
             from app.database import SessionLocal
             with SessionLocal() as db:
                 try:
+                    try:
+                        ops_logger.info(f"Procesando incidencias archivo={name_only} usuario={current_user.nombre_usuario}")
+                    except Exception:
+                        pass
                     inserted = process_incidencias(file_location, db=db, username=current_user.nombre_usuario, original_name=name_only)
                     # commit once
                     db.commit()
                 except Exception as pi_err:
                     tb = traceback.format_exc()
-                    logging.error(f"Error procesando incidencias y ejecutando SP: {pi_err}\n{tb}")
+                    ops_logger.error(f"Error procesando incidencias y ejecutando SP: {pi_err}\n{tb}")
                     try:
                         db.rollback()
                     except Exception:
@@ -484,7 +538,7 @@ async def procesar_incidencias(file: UploadFile = File(...), current_user: model
                     try:
                         safe_remove(file_location)
                     except Exception as rm_err:
-                        logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
+                        ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
                     return JSONResponse(status_code=500, content={"rows_inserted": 0, "error": "Error al procesar archivo de incidencias; verificar api.log"})
         except Exception:
             # Fallback: try to parse without DB (but we cannot insert), return error
@@ -505,13 +559,13 @@ async def procesar_incidencias(file: UploadFile = File(...), current_user: model
         try:
             safe_remove(file_location)
         except Exception as del_err:
-            logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
+            ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
 
         return {"rows_inserted": inserted}
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"Error procesando archivo de incidencias {filename}: {e}")
+        ops_logger.error(f"Error procesando archivo de incidencias {filename}: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 @app.post("/procesar-pipeline-transporte")
 @app.post("/procesar-pipeline-transporte/")
@@ -522,13 +576,13 @@ async def procesar_pipeline_transporte(file: UploadFile = File(...), current_use
     name_only, _ext = os.path.splitext(filename)
     m = re.match(r"^pipelineTransporte_sem_(\d{1,2})_(\d{2})-(\d{4})$", name_only, re.IGNORECASE)
     if not m:
-        logging.warning(f"Archivo pipeline transporte con nombre inválido recibido: {filename}")
+        ops_logger.warning(f"Archivo pipeline transporte con nombre inválido recibido: {filename}")
         raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'pipelineTransporte_sem_XX_MM-AAAA'")
     week = int(m.group(1))
     month = int(m.group(2))
     year = int(m.group(3))
     if week < 1 or week > 53 or month < 1 or month > 12 or year < 2000 or year > 2100:
-        logging.warning(f"Archivo pipeline transporte con semana/mes/año inválido en el nombre: {filename}")
+        ops_logger.warning(f"Archivo pipeline transporte con semana/mes/año inválido en el nombre: {filename}")
         raise HTTPException(status_code=400, detail="La semana, mes o año en el nombre del archivo no es válido")
 
     # Verificar en mi_bitacora_operaciones si ya fue procesado
@@ -549,16 +603,16 @@ async def procesar_pipeline_transporte(file: UploadFile = File(...), current_use
                     except Exception:
                         proc_fecha_str = str(proc_fecha)
                     msg = f"El archivo ya fue procesado por {proc_user} el {proc_fecha_str}"
-                    logging.info(f"Archivo {filename} ya procesado: {msg}")
+                    ops_logger.info(f"Archivo {filename} ya procesado: {msg}")
                     raise HTTPException(status_code=400, detail=msg)
             except HTTPException:
                 raise
             except Exception as e:
-                logging.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
+                ops_logger.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
     except Exception as e:
         if isinstance(e, HTTPException):
             raise
-        logging.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
+        ops_logger.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
 
     try:
         file_location = f"temp_{file.filename}"
@@ -570,12 +624,16 @@ async def procesar_pipeline_transporte(file: UploadFile = File(...), current_use
             from app.database import SessionLocal
             with SessionLocal() as db:
                 try:
+                    try:
+                        ops_logger.info(f"Procesando pipeline_transporte archivo={name_only} usuario={current_user.nombre_usuario}")
+                    except Exception:
+                        pass
                     processed = process_pipeline_transporte(file_location, db=db, username=current_user.nombre_usuario, original_name=name_only)
                     # commit once
                     db.commit()
                 except Exception as pi_err:
                     tb = traceback.format_exc()
-                    logging.error(f"Error procesando pipeline transporte y ejecutando SP: {pi_err}\n{tb}")
+                    ops_logger.error(f"Error procesando pipeline transporte y ejecutando SP: {pi_err}\n{tb}")
                     try:
                         db.rollback()
                     except Exception:
@@ -583,7 +641,7 @@ async def procesar_pipeline_transporte(file: UploadFile = File(...), current_use
                     try:
                         safe_remove(file_location)
                     except Exception as rm_err:
-                        logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
+                        ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
                     return JSONResponse(status_code=500, content={"rows_inserted": 0, "error": "Error al procesar archivo pipeline; verificar api.log"})
         except Exception:
             # Fallback: try to parse without DB (but we cannot insert), return error
@@ -603,13 +661,13 @@ async def procesar_pipeline_transporte(file: UploadFile = File(...), current_use
         try:
             safe_remove(file_location)
         except Exception as del_err:
-            logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
+            ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
 
         return {"rows_inserted": processed}
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"Error procesando archivo pipeline {filename}: {e}")
+        ops_logger.error(f"Error procesando archivo pipeline {filename}: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 
 
@@ -622,14 +680,14 @@ async def procesar_pipeline_comercial(file: UploadFile = File(...), current_user
     name_only, _ext = os.path.splitext(filename)
     m = re.match(r"^pipelineComercial_sem(\d{1,2})_(\d{2})-(\d{2})-(\d{4})$", name_only, re.IGNORECASE)
     if not m:
-        logging.warning(f"Archivo pipeline comercial con nombre inválido recibido: {filename}")
+        ops_logger.warning(f"Archivo pipeline comercial con nombre inválido recibido: {filename}")
         raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'pipelineComercial_semXX_DD-MM-AAAA'")
     week = int(m.group(1))
     day = int(m.group(2))
     month = int(m.group(3))
     year = int(m.group(4))
     if week < 1 or week > 53 or day < 1 or day > 31 or month < 1 or month > 12 or year < 2000 or year > 2100:
-        logging.warning(f"Archivo pipeline comercial con semana/dia/mes/año inválido en el nombre: {filename}")
+        ops_logger.warning(f"Archivo pipeline comercial con semana/dia/mes/año inválido en el nombre: {filename}")
         raise HTTPException(status_code=400, detail="La semana, día, mes o año en el nombre del archivo no es válido")
 
     # Verificar en mi_bitacora_operaciones si ya fue procesado
@@ -650,16 +708,16 @@ async def procesar_pipeline_comercial(file: UploadFile = File(...), current_user
                     except Exception:
                         proc_fecha_str = str(proc_fecha)
                     msg = f"El archivo ya fue procesado por {proc_user} el {proc_fecha_str}"
-                    logging.info(f"Archivo {filename} ya procesado: {msg}")
+                    ops_logger.info(f"Archivo {filename} ya procesado: {msg}")
                     raise HTTPException(status_code=400, detail=msg)
             except HTTPException:
                 raise
             except Exception as e:
-                logging.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
+                ops_logger.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
     except Exception as e:
         if isinstance(e, HTTPException):
             raise
-        logging.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
+        ops_logger.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
 
     try:
         file_location = f"temp_{file.filename}"
@@ -671,12 +729,16 @@ async def procesar_pipeline_comercial(file: UploadFile = File(...), current_user
             from app.database import SessionLocal
             with SessionLocal() as db:
                 try:
+                    try:
+                        ops_logger.info(f"Procesando pipeline_comercial archivo={name_only} usuario={current_user.nombre_usuario}")
+                    except Exception:
+                        pass
                     processed = process_pipeline_comercial(file_location, db=db, username=current_user.nombre_usuario, original_name=name_only)
                     # commit once
                     db.commit()
                 except Exception as pi_err:
                     tb = traceback.format_exc()
-                    logging.error(f"Error procesando pipeline comercial y ejecutando SP: {pi_err}\n{tb}")
+                    ops_logger.error(f"Error procesando pipeline comercial y ejecutando SP: {pi_err}\n{tb}")
                     try:
                         db.rollback()
                     except Exception:
@@ -684,7 +746,7 @@ async def procesar_pipeline_comercial(file: UploadFile = File(...), current_user
                     try:
                         safe_remove(file_location)
                     except Exception as rm_err:
-                        logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
+                        ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
                     return JSONResponse(status_code=500, content={"rows_inserted": 0, "error": "Error al procesar archivo pipeline comercial; verificar api.log"})
         except Exception:
             # Fallback: try to parse without DB (but we cannot insert), return error
@@ -704,13 +766,13 @@ async def procesar_pipeline_comercial(file: UploadFile = File(...), current_user
         try:
             safe_remove(file_location)
         except Exception as del_err:
-            logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
+            ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
 
         return {"rows_inserted": processed}
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"Error procesando archivo pipeline comercial {filename}: {e}")
+        ops_logger.error(f"Error procesando archivo pipeline comercial {filename}: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 
 
@@ -724,12 +786,12 @@ async def procesar_disponibilidad_transporte(file: UploadFile = File(...), curre
 
     m = re.match(r"^disponibilidadTransporte_(\d{2})-(\d{4})$", name_only, re.IGNORECASE)
     if not m:
-        logging.warning(f"Archivo disponibilidad transporte con nombre inválido recibido: {filename}")
+        ops_logger.warning(f"Archivo disponibilidad transporte con nombre inválido recibido: {filename}")
         raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'disponibilidadTransporte_MM-AAAA'")
     month = int(m.group(1))
     year = int(m.group(2))
     if month < 1 or month > 12 or year < 2000 or year > 2100:
-        logging.warning(f"Archivo disponibilidad transporte con mes/año inválido en el nombre: {filename}")
+        ops_logger.warning(f"Archivo disponibilidad transporte con mes/año inválido en el nombre: {filename}")
         raise HTTPException(status_code=400, detail="El mes o año en el nombre del archivo no es válido")
 
     # Verificar en mi_bitacora_operaciones si ya fue procesado
@@ -750,16 +812,16 @@ async def procesar_disponibilidad_transporte(file: UploadFile = File(...), curre
                     except Exception:
                         proc_fecha_str = str(proc_fecha)
                     msg = f"El archivo ya fue procesado por {proc_user} el {proc_fecha_str}"
-                    logging.info(f"Archivo {filename} ya procesado: {msg}")
+                    ops_logger.info(f"Archivo {filename} ya procesado: {msg}")
                     raise HTTPException(status_code=400, detail=msg)
             except HTTPException:
                 raise
             except Exception as e:
-                logging.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
+                ops_logger.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
     except Exception as e:
         if isinstance(e, HTTPException):
             raise
-        logging.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
+        ops_logger.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
 
     try:
         file_location = f"temp_{file.filename}"
@@ -771,11 +833,15 @@ async def procesar_disponibilidad_transporte(file: UploadFile = File(...), curre
             from app.database import SessionLocal
             with SessionLocal() as db:
                 try:
+                    try:
+                        ops_logger.info(f"Procesando disponibilidad_transporte archivo={name_only} usuario={current_user.nombre_usuario}")
+                    except Exception:
+                        pass
                     processed = process_disponibilidad_transporte(file_location, db=db, username=current_user.nombre_usuario, original_name=name_only)
                     db.commit()
                 except Exception as pi_err:
                     tb = traceback.format_exc()
-                    logging.error(f"Error procesando disponibilidad transporte y ejecutando SP: {pi_err}\n{tb}")
+                    ops_logger.error(f"Error procesando disponibilidad transporte y ejecutando SP: {pi_err}\n{tb}")
                     try:
                         db.rollback()
                     except Exception:
@@ -783,7 +849,7 @@ async def procesar_disponibilidad_transporte(file: UploadFile = File(...), curre
                     try:
                         safe_remove(file_location)
                     except Exception as rm_err:
-                        logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
+                        ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
                     return JSONResponse(status_code=500, content={"rows_inserted": 0, "error": "Error al procesar archivo disponibilidad; verificar api.log"})
         except Exception:
             # Fallback: try to parse without DB (but we cannot insert), return error
@@ -803,13 +869,13 @@ async def procesar_disponibilidad_transporte(file: UploadFile = File(...), curre
         try:
             safe_remove(file_location)
         except Exception as del_err:
-            logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
+            ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
 
         return {"rows_inserted": processed}
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"Error procesando archivo disponibilidad {filename}: {e}")
+        ops_logger.error(f"Error procesando archivo disponibilidad {filename}: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 
 
@@ -822,14 +888,14 @@ async def procesar_factoraje(file: UploadFile = File(...), current_user: models.
     name_only, _ext = os.path.splitext(filename)
     m = re.match(r"^factoraje_(\d{2})-(\d{2})-(\d{4})$", name_only, re.IGNORECASE)
     if not m:
-        logging.warning(f"Archivo factoraje con nombre inválido recibido: {filename}")
+        ops_logger.warning(f"Archivo factoraje con nombre inválido recibido: {filename}")
         raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'factoraje_DD-MM-AAAA'")
 
     day = int(m.group(1))
     month = int(m.group(2))
     year = int(m.group(3))
     if day < 1 or day > 31 or month < 1 or month > 12 or year < 2000 or year > 2100:
-        logging.warning(f"Archivo factoraje con fecha inválida en el nombre: {filename}")
+        ops_logger.warning(f"Archivo factoraje con fecha inválida en el nombre: {filename}")
         raise HTTPException(status_code=400, detail="La fecha en el nombre del archivo no es válida")
 
     # Verificar en mi_bitacora_operaciones si ya fue procesado
@@ -850,16 +916,16 @@ async def procesar_factoraje(file: UploadFile = File(...), current_user: models.
                     except Exception:
                         proc_fecha_str = str(proc_fecha)
                     msg = f"El archivo ya fue procesado por {proc_user} el {proc_fecha_str}"
-                    logging.info(f"Archivo {filename} ya procesado: {msg}")
+                    ops_logger.info(f"Archivo {filename} ya procesado: {msg}")
                     raise HTTPException(status_code=400, detail=msg)
             except HTTPException:
                 raise
             except Exception as e:
-                logging.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
+                ops_logger.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
     except Exception as e:
         if isinstance(e, HTTPException):
             raise
-        logging.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
+        ops_logger.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
 
     try:
         file_location = f"temp_{file.filename}"
@@ -871,12 +937,16 @@ async def procesar_factoraje(file: UploadFile = File(...), current_user: models.
             from app.database import SessionLocal
             with SessionLocal() as db:
                 try:
+                    try:
+                        ops_logger.info(f"Procesando factoraje archivo={name_only} usuario={current_user.nombre_usuario}")
+                    except Exception:
+                        pass
                     inserted = process_factoraje(file_location, db=db, username=current_user.nombre_usuario, original_name=name_only)
                     # commit once
                     db.commit()
                 except Exception as pi_err:
                     tb = traceback.format_exc()
-                    logging.error(f"Error procesando factoraje y ejecutando SP: {pi_err}\n{tb}")
+                    ops_logger.error(f"Error procesando factoraje y ejecutando SP: {pi_err}\n{tb}")
                     try:
                         db.rollback()
                     except Exception:
@@ -884,7 +954,7 @@ async def procesar_factoraje(file: UploadFile = File(...), current_user: models.
                     try:
                         safe_remove(file_location)
                     except Exception as rm_err:
-                        logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
+                        ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
                     return JSONResponse(status_code=500, content={"rows_inserted": 0, "error": "Error al procesar archivo factoraje; verificar api.log"})
         except Exception:
             # Fallback: try to parse without DB (but we cannot insert), return error
@@ -904,13 +974,13 @@ async def procesar_factoraje(file: UploadFile = File(...), current_user: models.
         try:
             safe_remove(file_location)
         except Exception as del_err:
-            logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
+            ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
 
         return {"rows_inserted": inserted}
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"Error procesando archivo factoraje {filename}: {e}")
+        ops_logger.error(f"Error procesando archivo factoraje {filename}: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 
 
@@ -924,14 +994,14 @@ async def procesar_relacion_pago(file: UploadFile = File(...), current_user: mod
     m = re.match(r"^relacionPago_(\d{2})-(\d{2})-(\d{4})$", name_only, re.IGNORECASE)
     if not m:
         # log the repr so invisible characters (BOM, trailing spaces) are visible in the logs
-        logging.warning(f"Archivo relacionPago con nombre inválido recibido: {filename!r}")
+        ops_logger.warning(f"Archivo relacionPago con nombre inválido recibido: {filename!r}")
         raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'relacionPago_DD-MM-AAAA'")
 
     day = int(m.group(1))
     month = int(m.group(2))
     year = int(m.group(3))
     if day < 1 or day > 31 or month < 1 or month > 12 or year < 2000 or year > 2100:
-        logging.warning(f"Archivo relacionPago con fecha inválida en el nombre: {filename!r}")
+        ops_logger.warning(f"Archivo relacionPago con fecha inválida en el nombre: {filename!r}")
         raise HTTPException(status_code=400, detail="La fecha en el nombre del archivo no es válida")
 
     # Verificar en mi_bitacora_operaciones si ya fue procesado
@@ -952,16 +1022,16 @@ async def procesar_relacion_pago(file: UploadFile = File(...), current_user: mod
                     except Exception:
                         proc_fecha_str = str(proc_fecha)
                     msg = f"El archivo ya fue procesado por {proc_user} el {proc_fecha_str}"
-                    logging.info(f"Archivo {filename} ya procesado: {msg}")
+                    ops_logger.info(f"Archivo {filename} ya procesado: {msg}")
                     raise HTTPException(status_code=400, detail=msg)
             except HTTPException:
                 raise
             except Exception as e:
-                logging.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
+                ops_logger.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
     except Exception as e:
         if isinstance(e, HTTPException):
             raise
-        logging.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
+        ops_logger.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
 
     try:
         file_location = f"temp_{file.filename}"
@@ -973,12 +1043,16 @@ async def procesar_relacion_pago(file: UploadFile = File(...), current_user: mod
             from app.database import SessionLocal
             with SessionLocal() as db:
                 try:
+                    try:
+                        ops_logger.info(f"Procesando relacion_pago archivo={name_only} usuario={current_user.nombre_usuario}")
+                    except Exception:
+                        pass
                     inserted = process_relacion_pago(file_location, db=db, username=current_user.nombre_usuario, original_name=name_only)
                     # commit once
                     db.commit()
                 except Exception as pi_err:
                     tb = traceback.format_exc()
-                    logging.error(f"Error procesando relacion_pago y ejecutando SP: {pi_err}\n{tb}")
+                    ops_logger.error(f"Error procesando relacion_pago y ejecutando SP: {pi_err}\n{tb}")
                     try:
                         db.rollback()
                     except Exception:
@@ -986,7 +1060,7 @@ async def procesar_relacion_pago(file: UploadFile = File(...), current_user: mod
                     try:
                         safe_remove(file_location)
                     except Exception as rm_err:
-                        logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
+                        ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
                     return JSONResponse(status_code=500, content={"rows_inserted": 0, "error": "Error al procesar archivo factoraje; verificar api.log"})
         except Exception:
             # Fallback: try to parse without DB (but we cannot insert), return error
@@ -1006,13 +1080,13 @@ async def procesar_relacion_pago(file: UploadFile = File(...), current_user: mod
         try:
             safe_remove(file_location)
         except Exception as del_err:
-            logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
+            ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
 
         return {"rows_inserted": inserted}
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"Error procesando archivo process_relacion_pago {filename}: {e}")
+        ops_logger.error(f"Error procesando archivo process_relacion_pago {filename}: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 
 
@@ -1025,14 +1099,14 @@ async def procesar_evidencias_pendientes(file: UploadFile = File(...), current_u
     name_only, _ext = os.path.splitext(filename)
     m = re.match(r"^evidenciasPendientes_(\d{2})_(\d{2})-(\d{4})$", name_only, re.IGNORECASE)
     if not m:
-        logging.warning(f"Archivo evidenciasPendientes con nombre inválido recibido: {filename!r}")
+        ops_logger.warning(f"Archivo evidenciasPendientes con nombre inválido recibido: {filename!r}")
         raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'evidenciasPendientes_DD_MM-AAAA'")
 
     day = int(m.group(1))
     month = int(m.group(2))
     year = int(m.group(3))
     if day < 1 or day > 31 or month < 1 or month > 12 or year < 2000 or year > 2100:
-        logging.warning(f"Archivo evidenciasPendientes con fecha inválida en el nombre: {name_only!r}")
+        ops_logger.warning(f"Archivo evidenciasPendientes con fecha inválida en el nombre: {name_only!r}")
         raise HTTPException(status_code=400, detail="La fecha en el nombre del archivo no es válida")
 
     # Verificar en mi_bitacora_operaciones si ya fue procesado
@@ -1053,16 +1127,16 @@ async def procesar_evidencias_pendientes(file: UploadFile = File(...), current_u
                     except Exception:
                         proc_fecha_str = str(proc_fecha)
                     msg = f"El archivo ya fue procesado por {proc_user} el {proc_fecha_str}"
-                    logging.info(f"Archivo {filename} ya procesado: {msg}")
+                    ops_logger.info(f"Archivo {filename} ya procesado: {msg}")
                     raise HTTPException(status_code=400, detail=msg)
             except HTTPException:
                 raise
             except Exception as e:
-                logging.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
+                ops_logger.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
     except Exception as e:
         if isinstance(e, HTTPException):
             raise
-        logging.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
+        ops_logger.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
 
     try:
         file_location = f"temp_{file.filename}"
@@ -1074,12 +1148,16 @@ async def procesar_evidencias_pendientes(file: UploadFile = File(...), current_u
             from app.database import SessionLocal
             with SessionLocal() as db:
                 try:
+                    try:
+                        ops_logger.info(f"Procesando evidencias_pendientes archivo={name_only} usuario={current_user.nombre_usuario}")
+                    except Exception:
+                        pass
                     inserted = process_evidencias_pendientes(file_location, db=db, username=current_user.nombre_usuario, original_name=name_only)
                     # commit once
                     db.commit()
                 except Exception as pi_err:
                     tb = traceback.format_exc()
-                    logging.error(f"Error procesando evidencias pendientes y ejecutando SP: {pi_err}\n{tb}")
+                    ops_logger.error(f"Error procesando evidencias pendientes y ejecutando SP: {pi_err}\n{tb}")
                     try:
                         db.rollback()
                     except Exception:
@@ -1087,7 +1165,7 @@ async def procesar_evidencias_pendientes(file: UploadFile = File(...), current_u
                     try:
                         safe_remove(file_location)
                     except Exception as rm_err:
-                        logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
+                        ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
                     return JSONResponse(status_code=500, content={"rows_inserted": 0, "error": "Error al procesar archivo evidencias pendientes; verificar api.log"})
         except Exception:
             # Fallback: try to parse without DB (but we cannot insert), return error
@@ -1107,13 +1185,13 @@ async def procesar_evidencias_pendientes(file: UploadFile = File(...), current_u
         try:
             safe_remove(file_location)
         except Exception as del_err:
-            logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
+            ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
 
         return {"rows_inserted": inserted}
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"Error procesando archivo evidencias_pendientes {name_only}: {e}")
+        ops_logger.error(f"Error procesando archivo evidencias_pendientes {name_only}: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 
 
@@ -1126,13 +1204,13 @@ async def procesar_venta_perdida(file: UploadFile = File(...), current_user: mod
     name_only, _ext = os.path.splitext(filename)
     m = re.match(r"^ventaPerdida_(\d{2})-(\d{4})$", name_only, re.IGNORECASE)
     if not m:
-        logging.warning(f"Archivo ventaPerdida con nombre inválido recibido: {filename!r}")
+        ops_logger.warning(f"Archivo ventaPerdida con nombre inválido recibido: {filename!r}")
         raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'ventaPerdida_MM-AAAA'")
 
     month = int(m.group(1))
     year = int(m.group(2))
     if month < 1 or month > 12 or year < 2000 or year > 2100:
-        logging.warning(f"Archivo ventaPerdida con mes/año inválido en el nombre: {name_only!r}")
+        ops_logger.warning(f"Archivo ventaPerdida con mes/año inválido en el nombre: {name_only!r}")
         raise HTTPException(status_code=400, detail="El mes o año en el nombre del archivo no es válido")
 
     # Verificar en mi_bitacora_operaciones si ya fue procesado
@@ -1153,16 +1231,16 @@ async def procesar_venta_perdida(file: UploadFile = File(...), current_user: mod
                     except Exception:
                         proc_fecha_str = str(proc_fecha)
                     msg = f"El archivo ya fue procesado por {proc_user} el {proc_fecha_str}"
-                    logging.info(f"Archivo {filename} ya procesado: {msg}")
+                    ops_logger.info(f"Archivo {filename} ya procesado: {msg}")
                     raise HTTPException(status_code=400, detail=msg)
             except HTTPException:
                 raise
             except Exception as e:
-                logging.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
+                ops_logger.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
     except Exception as e:
         if isinstance(e, HTTPException):
             raise
-        logging.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
+        ops_logger.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
 
     try:
         file_location = f"temp_{file.filename}"
@@ -1174,12 +1252,16 @@ async def procesar_venta_perdida(file: UploadFile = File(...), current_user: mod
             from app.database import SessionLocal
             with SessionLocal() as db:
                 try:
+                    try:
+                        ops_logger.info(f"Procesando venta_perdida archivo={name_only} usuario={current_user.nombre_usuario}")
+                    except Exception:
+                        pass
                     inserted = process_venta_perdida(file_location, db=db, username=current_user.nombre_usuario, original_name=name_only)
                     # commit once
                     db.commit()
                 except Exception as pi_err:
                     tb = traceback.format_exc()
-                    logging.error(f"Error procesando venta perdida y ejecutando SP: {pi_err}\n{tb}")
+                    ops_logger.error(f"Error procesando venta perdida y ejecutando SP: {pi_err}\n{tb}")
                     try:
                         db.rollback()
                     except Exception:
@@ -1187,7 +1269,7 @@ async def procesar_venta_perdida(file: UploadFile = File(...), current_user: mod
                     try:
                         safe_remove(file_location)
                     except Exception as rm_err:
-                        logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
+                        ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
                     return JSONResponse(status_code=500, content={"rows_inserted": 0, "error": "Error al procesar archivo venta perdida; verificar api.log"})
         except Exception:
             # Fallback: try to parse without DB (but we cannot insert), return error
@@ -1207,13 +1289,13 @@ async def procesar_venta_perdida(file: UploadFile = File(...), current_user: mod
         try:
             safe_remove(file_location)
         except Exception as del_err:
-            logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
+            ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
 
         return {"rows_inserted": inserted}
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"Error procesando archivo ventaPerdida {name_only}: {e}")
+        ops_logger.error(f"Error procesando archivo ventaPerdida {name_only}: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 
 
@@ -1226,14 +1308,14 @@ async def procesar_pronostico_cobranza(file: UploadFile = File(...), current_use
     name_only, _ext = os.path.splitext(filename)
     m = re.match(r"^pronosticoCobranza_(\d{2})-(\d{2})-(\d{4})$", name_only, re.IGNORECASE)
     if not m:
-        logging.warning(f"Archivo pronosticoCobranza con nombre inválido recibido: {filename!r}")
+        ops_logger.warning(f"Archivo pronosticoCobranza con nombre inválido recibido: {filename!r}")
         raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'pronosticoCobranza_DD-MM-AAAA'")
 
     day = int(m.group(1))
     month = int(m.group(2))
     year = int(m.group(3))
     if day < 1 or day > 31 or month < 1 or month > 12 or year < 2000 or year > 2100:
-        logging.warning(f"Archivo pronosticoCobranza con fecha inválida en el nombre: {name_only!r}")
+        ops_logger.warning(f"Archivo pronosticoCobranza con fecha inválida en el nombre: {name_only!r}")
         raise HTTPException(status_code=400, detail="La fecha en el nombre del archivo no es válida")
 
     # Verificar en mi_bitacora_operaciones si ya fue procesado
@@ -1254,16 +1336,16 @@ async def procesar_pronostico_cobranza(file: UploadFile = File(...), current_use
                     except Exception:
                         proc_fecha_str = str(proc_fecha)
                     msg = f"El archivo ya fue procesado por {proc_user} el {proc_fecha_str}"
-                    logging.info(f"Archivo {filename} ya procesado: {msg}")
+                    ops_logger.info(f"Archivo {filename} ya procesado: {msg}")
                     raise HTTPException(status_code=400, detail=msg)
             except HTTPException:
                 raise
             except Exception as e:
-                logging.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
+                ops_logger.warning(f"No se pudo verificar si el archivo ya fue procesado (continuando): {e}")
     except Exception as e:
         if isinstance(e, HTTPException):
             raise
-        logging.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
+        ops_logger.warning(f"No se pudo abrir sesión para verificar bitácora; continuando con el procesamiento: {e}")
 
     try:
         file_location = f"temp_{file.filename}"
@@ -1275,12 +1357,16 @@ async def procesar_pronostico_cobranza(file: UploadFile = File(...), current_use
             from app.database import SessionLocal
             with SessionLocal() as db:
                 try:
+                    try:
+                        ops_logger.info(f"Procesando pronostico_cobranza archivo={name_only} usuario={current_user.nombre_usuario}")
+                    except Exception:
+                        pass
                     inserted = process_pronostico_cobranza(file_location, db=db, username=current_user.nombre_usuario, original_name=name_only)
                     # commit once
                     db.commit()
                 except Exception as pi_err:
                     tb = traceback.format_exc()
-                    logging.error(f"Error procesando pronostico cobranza y ejecutando SP: {pi_err}\n{tb}")
+                    ops_logger.error(f"Error procesando pronostico cobranza y ejecutando SP: {pi_err}\n{tb}")
                     try:
                         db.rollback()
                     except Exception:
@@ -1288,7 +1374,7 @@ async def procesar_pronostico_cobranza(file: UploadFile = File(...), current_use
                     try:
                         safe_remove(file_location)
                     except Exception as rm_err:
-                        logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
+                        ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {rm_err}")
                     return JSONResponse(status_code=500, content={"rows_inserted": 0, "error": "Error al procesar archivo pronostico cobranza; verificar api.log"})
         except Exception:
             # Fallback: try to parse without DB (but we cannot insert), return error
@@ -1308,13 +1394,13 @@ async def procesar_pronostico_cobranza(file: UploadFile = File(...), current_use
         try:
             safe_remove(file_location)
         except Exception as del_err:
-            logging.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
+            ops_logger.warning(f"No se pudo eliminar el archivo temporal {file_location}: {del_err}")
 
         return {"rows_inserted": inserted}
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"Error procesando archivo pronosticoCobranza {name_only}: {e}")
+        ops_logger.error(f"Error procesando archivo pronosticoCobranza {name_only}: {e}")
         raise HTTPException(status_code=400, detail=f"Error procesando archivo: {str(e)}")
 
 
