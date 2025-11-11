@@ -690,8 +690,8 @@ def process_incidencias(file_path: str, db: object, username: Optional[str] = No
         # Build insert SQL with proper column names (use brackets for special names)
         insert_sql = (
             "INSERT INTO dbo.incidencias_tmp (Carta_Porte, [Número_Envío], Cliente, [Línea_Transportista], "
-            "Operador, Origen, Destino, Anomalía, Fecha, Coordenadas_Lat, Coordenadas_Lon, Ubicación, Comentarios) "
-            "VALUES (:Carta_Porte, :Numero_Envio, :Cliente, :Linea_Transportista, :Operador, :Origen, :Destino, :Anomalia, :Fecha, :Coordenadas_Lat, :Coordenadas_Lon, :Ubicacion, :Comentarios)"
+            "Operador, Origen, Destino, Anomalía, Fecha, Coordenadas_Lat, Coordenadas_Lon, Ubicación, Comentarios,creado_por) "
+            "VALUES (:Carta_Porte, :Numero_Envio, :Cliente, :Linea_Transportista, :Operador, :Origen, :Destino, :Anomalia, :Fecha, :Coordenadas_Lat, :Coordenadas_Lon, :Ubicacion, :Comentarios,:Usuario_Creacion)"
         )
         total_inserted = 0
         # Use single transaction: execute inserts and then call sp_proc_ontime, commit once in caller
@@ -711,6 +711,7 @@ def process_incidencias(file_path: str, db: object, username: Optional[str] = No
                 'Coordenadas_Lon': None,
                 'Ubicacion': None,
                 'Comentarios': None,
+                'Usuario_Creacion': username if username else None
             }
 
             for key_norm, col in normalized_key_map.items():
