@@ -11,49 +11,10 @@ from datetime import datetime as _dt
 import re
 
 
-# --- Module logging: write excel_processor logs into logs/operations.log (rotated daily/size) ---
-try:
-    _logs_dir = ensure_logs_dir()
-
-    # Use a stable base filename for operations; rotation will create dated/numbered backups
-    _operations_base = os.path.join(_logs_dir, 'operations.log')
-
-    # Avoid adding multiple handlers if module is re-imported
-    _mod_logger = logging.getLogger(__name__)
-    if not any(getattr(h, 'baseFilename', None) and os.path.abspath(getattr(h, 'baseFilename')) == os.path.abspath(_operations_base) for h in _mod_logger.handlers):
-        _fmt = "%(asctime)s %(levelname)s %(message)s"
-
-        # Use milliseconds formatter like the rest of the app
-        class _MilliFormatter(logging.Formatter):
-            def formatTime(self, record, datefmt=None):
-                from datetime import datetime
-                ct = datetime.fromtimestamp(record.created)
-                s = ct.strftime("%Y-%m-%d %H:%M:%S")
-                ms = int(record.msecs)
-                return f"{s},{ms:03d}"
-
-        # Rotate daily at midnight and when size exceeds 10MB, keep 14 backups
-        _handler = SizeAndTimedRotatingFileHandler(_operations_base, when='midnight', backupCount=14, encoding='utf-8', maxBytes=10 * 1024 * 1024)
-        _handler.setLevel(logging.getLogger('operations').info)
-        _handler.setFormatter(_MilliFormatter(_fmt, datefmt="%Y-%m-%d %H:%M:%S"))
-        _mod_logger.addHandler(_handler)
-        _mod_logger.setLevel(logging.getLogger('operations').info)
-        _mod_logger.propagate = False
-
-    # Also ensure root logger has an api.log handler that rotates (only add if not present)
-    try:
-        _api_path = os.path.join(_logs_dir, 'api.log')
-        _root = logging.getLogger()
-        if not any(hasattr(h, 'baseFilename') and os.path.abspath(getattr(h, 'baseFilename')) == os.path.abspath(_api_path) for h in _root.handlers):
-            _api_handler = SizeAndTimedRotatingFileHandler(_api_path, when='midnight', backupCount=30, encoding='utf-8', maxBytes=10 * 1024 * 1024)
-            _api_handler.setLevel(logging.getLogger('operations').info)
-            _api_handler.setFormatter(_MilliFormatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-            _root.addHandler(_api_handler)
-    except Exception:
-        pass
-except Exception:
-    # If logging setup fails, continue without module-specific logging
-    logging.getLogger(__name__).warning("No se pudo configurar el logging específico para excel_processor")
+# Module logging: rely on the application to configure handlers for the
+# 'operations' logger (avoid creating handlers here to prevent duplicate
+# file handles which cause rotation failures on Windows).
+ops_logger = logging.getLogger('operations')
 
 def process_excel(file_path: str, db: Optional[object] = None, username: Optional[str] = None) -> List[Dict]:
     """Process an Excel file and optionally send OnTime rows to a stored procedure.
@@ -387,13 +348,13 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                         pass
 
                 # If we reach here, all executions for dbo.sp_ins_ontime succeeded.
-                # If a username was provided, call dbo.sp_proc_ontime with the user and processed filename
+                # If a username was provided, call dbo.sp_procesa_ontime_complet with the user and processed filename
                 try:
                     if username:
                         processed_name = name_only
                         if processed_name.lower().startswith('temp_'):
                             processed_name = processed_name[5:]
-                        sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado,11"
+                        sp2_sql = "EXEC dbo.sp_procesa_ontime_complet :nombre_usuario, :name_file_procesado"
                         logging.getLogger('operations').info(f"Ejecutando procedure para usuario={username}, archivo={processed_name}")
                         db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
                         try:
