@@ -43,54 +43,119 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
         is_ontime = bool(re.match(r"^temp_OnTime_acumulado_\d{4}$", name_only, re.IGNORECASE))
         logging.getLogger('operations').info(f"is_ontime: {is_ontime}")
         if is_ontime:
-            logging.getLogger('operations').info(f"Archivo detectado como OnTime, leyendo hoja 'OCT25' desde fila 7, columna 1: {filename}")
-            # Verificar que la hoja 'OCT25' exista (case-insensitive)
-            # Use context manager to ensure the Excel file handle is closed promptly
-            sheet_to_use = None
+            logging.getLogger('operations').info(f"Archivo detectado como OnTime, buscando hojas con formato MMMYY que contengan columna DATAWERHOUSE: {filename}")
+            # Buscar hojas que cumplan:
+            # 1. Formato MMMYY (3 letras del mes + 2 dígitos del año)
+            # 2. Contengan la columna "DATAWERHOUSE"
+            
+            # Pattern para detectar hojas MMMYY (ej: OCT25, ENE24, DIC25)
+            month_year_pattern = re.compile(r'^[A-Z]{3}\d{2}$', re.IGNORECASE)
+            
+            sheets_to_process = []
             with pd.ExcelFile(file_path) as xls:
-                for s in xls.sheet_names:
-                    # logging.getLogger('operations').info(f"HOJA {s}")
-                    if s.upper() == 'OCT25':
-                        sheet_to_use = s
-                        break
-            if sheet_to_use is None:
-                raise ValueError("Hoja 'OCT25' no encontrada en el archivo Excel")
-            # skiprows=6 hace que la lectura comience en la fila 7 (1-based)
-            # read_excel will open/close its own handle; using engine=openpyxl for .xlsx
-            df = pd.read_excel(file_path, sheet_name=sheet_to_use, skiprows=6)
-            # Para archivos OnTime la última columna de datos válida es la número 79 (1-based).
-            # Recortamos todas las columnas después de la columna 79 y seguimos con la siguiente fila.
-            # df.iloc uses 0-based indexing, por lo que usamos :79 para obtener las primeras 79 columnas.
-            if df.shape[1] > 79:
-                logging.getLogger('operations').info(f"OnTime file has {df.shape[1]} columns; trimming to 79 columns")
-                df = df.iloc[:, :79]
-            elif df.shape[1] < 79:
-                logging.getLogger('operations').warning(f"OnTime file {filename} tiene solo {df.shape[1]} columnas; se esperaban al menos 79")
+                for sheet_name in xls.sheet_names:
+                    # Verificar si cumple con el patrón MMMYY
+                    if month_year_pattern.match(sheet_name.strip()):
+                        # Leer preview de la hoja para verificar si contiene DATAWERHOUSE
+                        try:
+                            df_preview = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=6, nrows=0)
+                            # Normalizar nombres de columnas para búsqueda
+                            normalized_cols = [re.sub(r"\s+", " ", str(c).replace('\xa0', ' ')).strip().upper() for c in df_preview.columns]
+                            if 'DATAWERHOUSE' in normalized_cols:
+                                sheets_to_process.append(sheet_name)
+                                logging.getLogger('operations').info(f"Hoja '{sheet_name}' cumple criterios: formato MMMYY y contiene DATAWERHOUSE")
+                            else:
+                                logging.getLogger('operations').info(f"Hoja '{sheet_name}' tiene formato MMMYY pero no contiene columna DATAWERHOUSE")
+                        except Exception as preview_err:
+                            logging.getLogger('operations').warning(f"No se pudo verificar hoja '{sheet_name}': {preview_err}")
+            
+            if not sheets_to_process:
+                raise ValueError("No se encontraron hojas con formato MMMYY que contengan la columna DATAWERHOUSE")
+            
+            logging.getLogger('operations').info(f"Se procesarán {len(sheets_to_process)} hoja(s): {', '.join(sheets_to_process)}")
+            
+            # Procesar todas las hojas que cumplan los criterios
+            all_records = []
+            all_columns = None
+            
+            for sheet_to_use in sheets_to_process:
+                logging.getLogger('operations').info(f"Procesando hoja: '{sheet_to_use}'")
+                
+                # skiprows=6 hace que la lectura comience en la fila 7 (1-based)
+                # read_excel will open/close its own handle; using engine=openpyxl for .xlsx
+                df_sheet = pd.read_excel(file_path, sheet_name=sheet_to_use, skiprows=6)
+                
+                # Para archivos OnTime la última columna de datos válida es la número 79 (1-based).
+                # Recortamos todas las columnas después de la columna 79 y seguimos con la siguiente fila.
+                # df.iloc uses 0-based indexing, por lo que usamos :79 para obtener las primeras 79 columnas.
+                if df_sheet.shape[1] > 79:
+                    logging.getLogger('operations').info(f"Hoja '{sheet_to_use}' tiene {df_sheet.shape[1]} columnas; recortando a 79 columnas")
+                    df_sheet = df_sheet.iloc[:, :79]
+                elif df_sheet.shape[1] < 79:
+                    logging.getLogger('operations').warning(f"Hoja '{sheet_to_use}' tiene solo {df_sheet.shape[1]} columnas; se esperaban al menos 79")
+                
+                # Omitir filas que inicien con un campo vacío o nulo (primera columna)
+                if df_sheet.shape[1] > 0:
+                    first_col = df_sheet.columns[0]
+                    before_count = len(df_sheet)
+                    # máscara: valor no nulo y no vacío al convertir a string y hacer strip
+                    try:
+                        non_empty_mask = df_sheet[first_col].notnull() & (df_sheet[first_col].astype(str).str.strip() != '')
+                    except Exception:
+                        # si la conversión a str falla por algún tipo inusual, sólo filtrar nulos
+                        non_empty_mask = df_sheet[first_col].notnull()
+                    df_sheet = df_sheet[non_empty_mask]
+                    after_count = len(df_sheet)
+                    dropped = before_count - after_count
+                    if dropped > 0:
+                        logging.getLogger('operations').info(f"Hoja '{sheet_to_use}': omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+                
+                # Reemplaza NaN, inf y -inf por None para compatibilidad con JSON
+                df_sheet = df_sheet.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
+                df_sheet = df_sheet.where(pd.notnull(df_sheet), None)
+                
+                sheet_records = df_sheet.to_dict(orient='records')
+                all_records.extend(sheet_records)
+                
+                # Guardar las columnas de la primera hoja procesada para mapping
+                if all_columns is None:
+                    all_columns = list(df_sheet.columns)
+                
+                logging.getLogger('operations').info(f"Hoja '{sheet_to_use}' procesada: {len(sheet_records)} filas")
+            
+            logging.getLogger('operations').info(f"Total de registros combinados de todas las hojas: {len(all_records)}")
+            
+            # Usar los registros y columnas combinados
+            records = all_records
+            original_columns = all_columns
+            
+            # Crear un DataFrame consolidado para mantener compatibilidad con el resto del código
+            df = pd.DataFrame(records) if records else pd.DataFrame()
         else:
             df = pd.read_excel(file_path)
-        # Omitir filas que inicien con un campo vacío o nulo (primera columna)
-        if df.shape[1] > 0:
-            first_col = df.columns[0]
-            before_count = len(df)
-            # máscara: valor no nulo y no vacío al convertir a string y hacer strip
-            try:
-                non_empty_mask = df[first_col].notnull() & (df[first_col].astype(str).str.strip() != '')
-            except Exception:
-                # si la conversión a str falla por algún tipo inusual, sólo filtrar nulos
-                non_empty_mask = df[first_col].notnull()
-            df = df[non_empty_mask]
-            after_count = len(df)
-            dropped = before_count - after_count
-            if dropped > 0:
-                logging.getLogger('operations').info(f"Omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+            # Omitir filas que inicien con un campo vacío o nulo (primera columna)
+            if df.shape[1] > 0:
+                first_col = df.columns[0]
+                before_count = len(df)
+                # máscara: valor no nulo y no vacío al convertir a string y hacer strip
+                try:
+                    non_empty_mask = df[first_col].notnull() & (df[first_col].astype(str).str.strip() != '')
+                except Exception:
+                    # si la conversión a str falla por algún tipo inusual, sólo filtrar nulos
+                    non_empty_mask = df[first_col].notnull()
+                df = df[non_empty_mask]
+                after_count = len(df)
+                dropped = before_count - after_count
+                if dropped > 0:
+                    logging.getLogger('operations').info(f"Omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
 
-        # Reemplaza NaN, inf y -inf por None para compatibilidad con JSON
-        df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
-        df = df.where(pd.notnull(df), None)
-        logging.getLogger('operations').info(f"Archivo procesado correctamente: {file_path}, filas: {len(df)}")
-        records = df.to_dict(orient='records')
-        # Keep a copy of original columns for mapping; we'll support fuzzy header matching
-        original_columns = list(df.columns)
+            # Reemplaza NaN, inf y -inf por None para compatibilidad con JSON
+            df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
+            df = df.where(pd.notnull(df), None)
+            logging.getLogger('operations').info(f"Archivo procesado correctamente: {file_path}, filas: {len(df)}")
+            records = df.to_dict(orient='records')
+            # Keep a copy of original columns for mapping; we'll support fuzzy header matching
+            original_columns = list(df.columns)
 
         def _write_acumulado_file(target_file_path: str, name_only_local: str, count: int) -> None:
             """Write acumulado_<AAAA>.txt with the number of rows (count) next to the uploaded file.
@@ -201,6 +266,34 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
 
             # Build normalized map of record keys to original keys for fuzzy lookup
             normalized_key_map = {normalize_name(k): k for k in original_columns}
+
+            # Filter records: only insert rows where DATAWERHOUSE contains "CERRADO ddmmmYY" pattern
+            # Pattern: CERRADO followed by 2-digit day, 3-letter month, 2-digit year (e.g., "CERRADO 10NOV24")
+            datawerhouse_pattern = re.compile(r"CERRADO\s+\d{2}[A-Z]{3}\d{2}", re.IGNORECASE)
+            
+            # Find the DATAWERHOUSE column (try exact match first, then normalized)
+            datawerhouse_col = None
+            if "DATAWERHOUSE" in original_columns:
+                datawerhouse_col = "DATAWERHOUSE"
+            else:
+                normalized_dw = normalize_name("DATAWERHOUSE")
+                if normalized_dw in normalized_key_map:
+                    datawerhouse_col = normalized_key_map[normalized_dw]
+            
+            # Apply filter
+            original_count = len(records)
+            if datawerhouse_col:
+                filtered_records = [
+                    rec for rec in records
+                    if datawerhouse_col in rec and 
+                    rec[datawerhouse_col] is not None and
+                    datawerhouse_pattern.search(str(rec[datawerhouse_col]))
+                ]
+                records = filtered_records
+                filtered_count = len(records)
+                ops_logger.info(f"OnTime filter: {original_count} records read, {filtered_count} match DATAWERHOUSE pattern 'CERRADO ddmmmYY', {original_count - filtered_count} skipped")
+            else:
+                ops_logger.warning("DATAWERHOUSE column not found, inserting all records without filter")
 
             # Single-transaction strategy: execute SP for all rows and commit once.
             # Log the target database and current user for debugging where inserts go
@@ -834,10 +927,11 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
 
          # Expected headers (normalized) to map; we'll do fuzzy matching
         expected = [
-            'Nombre de la LT', 'Fecha de Prospección', 'Semana', 'Fuente de Prospecto', 'Responsable',
-            'Fases Pipeline', 'Medio de Contacto', 'Fecha último contacto', 'Días Pipeline', 'Nombre de contacto',
-            'Número Telefono', 'Correo electrónico', 'Ubicación', 'Tipo de unidad', 'Capacidad instalada',
-            'Requisitos básicos de carga', 'Ruta estrategica', 'Cliente estrategico', 'Comentarios'
+            'Proveedor', 'Fecha de Prospección', 'Semana', 'Fuente de Prospecto', 'Responsable',
+            'Fases Pipeline', 'Medio de Contacto', 'Fecha último contacto', 'Días Pipeline', 'Nombre de Contacto 1',
+            'Número Telefono 1', 'Correo Electrónico 1', 'Nombre de Contacto 2', 'Número Telefono 2', 'Correo Electrónico 2',
+            'Ubicación', 'Tipo de unidad', 'Capacidad instalada', 'Requisitos básicos de carga', 'Ruta estrategica', 
+            'Cliente estrategico', 'Comentarios'
         ]
         
         # Attempt to auto-detect header row: prefer header=1 (so data starts on row 3),
@@ -930,10 +1024,11 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
         normalized_expected_map = {nk(e): e for e in expected}
 
         insert_sql = (
-            "INSERT INTO dbo.pipeline_transporte_tmp (Nombre_LT, Fecha_Prospeccion, Semana, Fuente_Prospecto, Responsable, "
-            "Fases_Pipeline, Medio_Contacto, Fecha_Ultimo_Contacto, Dias_Pipeline, Nombre_Contacto, Numero_Telefono, Correo_Electronico, "
+            "INSERT INTO dbo.pipeline_transporte_tmp (Proveedor, Fecha_Prospeccion, Semana, Fuente_Prospecto, Responsable, "
+            "Fases_Pipeline, Medio_Contacto, Fecha_Ultimo_Contacto, Dias_Pipeline, Nombre_Contacto1, Numero_Telefono1, Correo_Electronico1, "
+            "Nombre_Contacto2, Numero_Telefono2, Correo_Electronico2, "
             "Ubicacion, Tipo_Unidad, Capacidad_Instalada, Requisitos_Basicos_Carga, Ruta_Estrategica, Cliente_Estrategico, Comentarios, Usuario_Creacion) "
-            "VALUES (:Nombre_LT, :Fecha_Prospeccion, :Semana, :Fuente_Prospecto, :Responsable, :Fases_Pipeline, :Medio_Contacto, :Fecha_Ultimo_Contacto, :Dias_Pipeline, :Nombre_Contacto, :Numero_Telefono, :Correo_Electronico, :Ubicacion, :Tipo_Unidad, :Capacidad_Instalada, :Requisitos_Basicos_Carga, :Ruta_Estrategica, :Cliente_Estrategico, :Comentarios, :Usuario_Creacion)"
+            "VALUES (:Proveedor, :Fecha_Prospeccion, :Semana, :Fuente_Prospecto, :Responsable, :Fases_Pipeline, :Medio_Contacto, :Fecha_Ultimo_Contacto, :Dias_Pipeline, :Nombre_Contacto1, :Numero_Telefono1, :Correo_Electronico1, :Nombre_Contacto2, :Numero_Telefono2, :Correo_Electronico2, :Ubicacion, :Tipo_Unidad, :Capacidad_Instalada, :Requisitos_Basicos_Carga, :Ruta_Estrategica, :Cliente_Estrategico, :Comentarios, :Usuario_Creacion)"
         )
 
         total_inserted = 0
@@ -947,9 +1042,9 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
 
         for idx, rec in enumerate(records, start=1):
             params = {
-                'Nombre_LT': None, 'Fecha_Prospeccion': None, 'Semana': None, 'Fuente_Prospecto': None, 'Responsable': None,
-                'Fases_Pipeline': None, 'Medio_Contacto': None, 'Fecha_Ultimo_Contacto': None, 'Dias_Pipeline': None, 'Nombre_Contacto': None,
-                'Numero_Telefono': None, 'Correo_Electronico': None, 'Ubicacion': None, 'Tipo_Unidad': None, 'Capacidad_Instalada': None,
+                'Proveedor': None, 'Fecha_Prospeccion': None, 'Semana': None, 'Fuente_Prospecto': None, 'Responsable': None,
+                'Fases_Pipeline': None, 'Medio_Contacto': None, 'Fecha_Ultimo_Contacto': None, 'Dias_Pipeline': None, 'Nombre_Contacto1': None,
+                'Numero_Telefono1': None, 'Correo_Electronico1': None,  'Nombre_Contacto2': None, 'Numero_Telefono2': None, 'Correo_Electronico2': None, 'Ubicacion': None, 'Tipo_Unidad': None, 'Capacidad_Instalada': None,
                 'Requisitos_Basicos_Carga': None, 'Ruta_Estrategica': None, 'Cliente_Estrategico': None, 'Comentarios': None, 'Usuario_Creacion': username
             }
 
@@ -1024,8 +1119,8 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
                             val = None
 
                 # Assign to params based on expected normalized name
-                if exp_norm == nk('Nombre de la LT'):
-                    params['Nombre_LT'] = val
+                if exp_norm == nk('Proveedor'):
+                    params['Proveedor'] = val
                 elif exp_norm == nk('Fecha de prospección'):
                     params['Fecha_Prospeccion'] = val
                 elif exp_norm == nk('Semana'):
@@ -1042,12 +1137,18 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
                     params['Fecha_Ultimo_Contacto'] = val
                 elif exp_norm == nk('Días Pipeline'):
                     params['Dias_Pipeline'] = val
-                elif exp_norm == nk('Nombre de contacto'):
-                    params['Nombre_Contacto'] = val
-                elif exp_norm == nk('Número Telefono'):
-                    params['Numero_Telefono'] = val
-                elif exp_norm == nk('Correo electrónico'):
-                    params['Correo_Electronico'] = val
+                elif exp_norm == nk('Nombre de Contacto 1'):
+                    params['Nombre_Contacto1'] = val
+                elif exp_norm == nk('Número Telefono 1'):
+                    params['Numero_Telefono1'] = val
+                elif exp_norm == nk('Correo Electrónico 1'):
+                    params['Correo_Electronico1'] = val
+                elif exp_norm == nk('Nombre de Contacto 2'):
+                    params['Nombre_Contacto2'] = val
+                elif exp_norm == nk('Número Telefono 2'):
+                    params['Numero_Telefono2'] = val
+                elif exp_norm == nk('Correo Electrónico 2'):
+                    params['Correo_Electronico2'] = val
                 elif exp_norm == nk('Ubicación'):
                     params['Ubicacion'] = val
                 elif exp_norm == nk('Tipo de unidad'):
@@ -1751,18 +1852,78 @@ def process_factoraje(file_path: str, db: object, username: Optional[str] = None
     except Exception:
         pass
     try:
-        # Read first sheet with header=0
+        # Buscar la fila que contiene "Nombre" como inicio de encabezados
+        # Leer sin encabezado para buscar en todas las celdas
+        df_search = pd.read_excel(file_path, sheet_name=0, header=None)
+        
+        # Función de normalización para búsqueda
+        def nk_local(s: str) -> str:
+            if s is None:
+                return ''
+            ss = str(s).replace('\xa0', ' ')
+            ss = unicodedata.normalize('NFKD', ss)
+            ss = ''.join(c for c in ss if not unicodedata.combining(c))
+            return re.sub(r"\s+", " ", ss).strip().upper()
+        
+        # Buscar "Nombre" en las primeras 20 filas y columnas
+        nombre_row = None
+        nombre_col_idx = None
+        cliente_col_idx = None
+        max_search_rows = min(20, len(df_search))
+        max_search_cols = min(20, df_search.shape[1])
+        
+        for row_idx in range(max_search_rows):
+            for col_idx in range(max_search_cols):
+                cell_value = df_search.iloc[row_idx, col_idx]
+                if cell_value is not None and nk_local(str(cell_value)) == 'NOMBRE':
+                    nombre_row = row_idx
+                    nombre_col_idx = col_idx
+                    logging.getLogger('operations').info(f"Encontrado 'Nombre' en fila {nombre_row} (0-based), columna {nombre_col_idx} (0-based)")
+                    
+                    # Buscar "CLIENTE" en la misma fila para determinar el rango de columnas
+                    for end_col_idx in range(col_idx + 1, min(col_idx + 20, df_search.shape[1])):
+                        end_cell = df_search.iloc[row_idx, end_col_idx]
+                        if end_cell is not None and nk_local(str(end_cell)) == 'CLIENTE':
+                            cliente_col_idx = end_col_idx
+                            logging.getLogger('operations').info(f"Encontrado 'CLIENTE' en columna {cliente_col_idx} (0-based)")
+                            break
+                    break
+            if nombre_row is not None:
+                break
+        
+        if nombre_row is None:
+            raise ValueError("No se encontró la celda con texto 'Nombre' en la primera hoja")
+        
+        if cliente_col_idx is None:
+            logging.getLogger('operations').warning("No se encontró 'CLIENTE', usando todas las columnas desde 'Nombre'")
+            cliente_col_idx = df_search.shape[1] - 1
+        
+        # Construir lista de columnas a leer (desde nombre_col_idx hasta cliente_col_idx inclusive)
+        cols_to_read = list(range(nombre_col_idx, cliente_col_idx + 1))
+        
+        # Leer usando header=nombre_row para que esa fila sea el encabezado
         try:
-            df = pd.read_excel(file_path, sheet_name=0, header=0)
-            logging.getLogger('operations').info("Reading factoraje first sheet with header=0")
+            df = pd.read_excel(
+                file_path, 
+                sheet_name=0, 
+                header=nombre_row,
+                usecols=cols_to_read
+            )
+            logging.getLogger('operations').info(f"Leyendo factoraje: encabezado en fila Excel {nombre_row + 1} (0-based: {nombre_row}), datos desde fila Excel {nombre_row + 2}, columnas {nombre_col_idx} a {cliente_col_idx}")
+            logging.getLogger('operations').info(f"Columnas leídas: {list(df.columns)}")
         except Exception as read_err:
-            logging.getLogger('operations').error(f"No se pudo leer la primera hoja: {read_err}")
-            raise
+            logging.getLogger('operations').error(f"No se pudo leer con usecols: {read_err}")
+            # Fallback sin usecols
+            df = pd.read_excel(file_path, sheet_name=0, header=nombre_row)
+            # Recortar columnas manualmente
+            if nombre_col_idx > 0 or cliente_col_idx < df.shape[1] - 1:
+                df = df.iloc[:, nombre_col_idx:cliente_col_idx + 1]
+                logging.getLogger('operations').info(f"Recortadas columnas en fallback: {list(df.columns)}")
 
         df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
         df = df.where(pd.notnull(df), None)
 
-        # Omit rows where first column is empty
+        # Filtrar filas donde la primera columna (Nombre) esté vacía
         if df.shape[1] > 0:
             first_col = df.columns[0]
             before_count = len(df)
@@ -1774,21 +1935,18 @@ def process_factoraje(file_path: str, db: object, username: Optional[str] = None
             after_count = len(df)
             dropped = before_count - after_count
             if dropped > 0:
-                logging.getLogger('operations').info(f"Factoraje: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+                logging.getLogger('operations').info(f"Factoraje: omitidas {dropped} filas con columna Nombre vacía")
 
         records = df.to_dict(orient='records')
         processed_count = len(records)
+        
+        # Log de muestra del primer registro
+        if len(records) > 0:
+            sample_rec = records[0]
+            logging.getLogger('operations').info(f"Primer registro de ejemplo - Nombre: '{sample_rec.get(df.columns[0])}', Columnas: {list(sample_rec.keys())}")
 
         # expected headers (human readable) - normalized comparison
         expected = ['Nombre', 'No Viaje', 'No Factura', 'Flete', 'Maniobras', 'Otros', 'Subtotal', 'IVA', 'ISR', 'Total', 'FECHA FACT', 'CLIENTE']
-
-        def nk_local(s: str) -> str:
-            if s is None:
-                return ''
-            ss = str(s).replace('\xa0', ' ')
-            ss = unicodedata.normalize('NFKD', ss)
-            ss = ''.join(c for c in ss if not unicodedata.combining(c))
-            return re.sub(r"\s+", " ", ss).strip().upper()
 
         normalized_key_map = {nk_local(k): k for k in list(df.columns)}
         normalized_expected = {nk_local(e): e for e in expected}
@@ -2450,17 +2608,11 @@ def process_evidencias_pendientes(file_path: str, db: object, username: Optional
         if sheet_to_use is None:
             raise ValueError("Hoja 'TABLA' no encontrada en el archivo Excel")
 
-        try:
-            df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=0)
-            logging.getLogger('operations').info(f"Reading evidencias_pendientes sheet '{sheet_to_use}' with header=0")
-        except Exception as read_err:
-            logging.getLogger('operations').error(f"No se pudo leer la hoja TABLA: {read_err}")
-            raise
-
-        df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
-        df = df.where(pd.notnull(df), None)
-
-        # Normalize header keys
+        # Buscar la celda que contiene "CLIENTE" para determinar la fila y columna de inicio
+        # Leer sin encabezado para buscar en todas las celdas
+        df_search = pd.read_excel(file_path, sheet_name=sheet_to_use, header=None)
+        
+        # Normalizar función para búsqueda
         def nk(s: str) -> str:
             if s is None:
                 return ''
@@ -2468,16 +2620,80 @@ def process_evidencias_pendientes(file_path: str, db: object, username: Optional
             ss = unicodedata.normalize('NFKD', ss)
             ss = ''.join(c for c in ss if not unicodedata.combining(c))
             return re.sub(r"\s+", " ", ss).strip().upper()
+        
+        # Buscar "CLIENTE" en las primeras 20 filas y columnas
+        cliente_row = None
+        cliente_col_idx = None
+        max_search_rows = min(20, len(df_search))
+        max_search_cols = min(20, df_search.shape[1])
+        
+        for row_idx in range(max_search_rows):
+            for col_idx in range(max_search_cols):
+                cell_value = df_search.iloc[row_idx, col_idx]
+                if cell_value is not None and nk(str(cell_value)) == 'CLIENTE':
+                    cliente_row = row_idx
+                    cliente_col_idx = col_idx
+                    logging.getLogger('operations').info(f"Encontrado 'CLIENTE' en fila {cliente_row} (0-based), columna {cliente_col_idx} (0-based)")
+                    break
+            if cliente_row is not None:
+                break
+        
+        if cliente_row is None:
+            raise ValueError("No se encontró la celda con texto 'CLIENTE' en la hoja TABLA")
+        
+        # Leer usando header=cliente_row directamente (pandas cuenta desde 0)
+        # Esto hará que pandas use la fila cliente_row como encabezado
+        # y los datos comenzarán automáticamente en cliente_row + 1
+        
+        # Construir lista de índices de columnas a leer (desde cliente_col_idx en adelante)
+        cols_to_read = list(range(cliente_col_idx, df_search.shape[1]))
+        
+        try:
+            # header=cliente_row: pandas usará esa fila (0-based) como encabezado
+            # usecols: usar solo las columnas desde cliente_col_idx en adelante
+            df = pd.read_excel(
+                file_path, 
+                sheet_name=sheet_to_use, 
+                header=cliente_row,
+                usecols=cols_to_read
+            )
+            logging.getLogger('operations').info(f"Leyendo evidencias_pendientes: encabezado en fila Excel {cliente_row + 1} (0-based: {cliente_row}), datos desde fila Excel {cliente_row + 2}, columnas desde índice {cliente_col_idx}")
+            
+            # Verificar que el encabezado contenga CLIENTE
+            cols_read = list(df.columns)
+            logging.getLogger('operations').info(f"Columnas leídas: {cols_read[:5]}...")  # Mostrar primeras 5 columnas
+        except Exception as read_err:
+            logging.getLogger('operations').error(f"No se pudo leer con usecols: {read_err}")
+            # Fallback sin usecols - usar header=cliente_row directamente
+            df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=cliente_row)
+            # Recortar columnas manualmente si cliente_col_idx > 0
+            if cliente_col_idx > 0 and df.shape[1] > cliente_col_idx:
+                df = df.iloc[:, cliente_col_idx:]
+                logging.getLogger('operations').info(f"Recortadas {cliente_col_idx} columnas del inicio en fallback")
+
+        df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
+        df = df.where(pd.notnull(df), None)
 
         cols = list(df.columns)
         normalized_map = {nk(c): c for c in cols}
 
+        # Verificar que la primera columna sea CLIENTE
         if 'CLIENTE' not in normalized_map:
-            # try common alternatives
-            raise ValueError("No se encontró la columna 'CLIENTE' en la hoja TABLA")
-
+            raise ValueError(f"Error en lectura: primera columna esperada 'CLIENTE' pero se encontró '{cols[0] if cols else 'ninguna'}'. Verifique el formato del archivo.")
+        
         cliente_col = normalized_map['CLIENTE']
         cliente_index = cols.index(cliente_col)
+        
+        # Validar que CLIENTE esté en la primera posición
+        if cliente_index != 0:
+            logging.getLogger('operations').warning(f"Columna CLIENTE encontrada en posición {cliente_index}, reordenando para que sea la primera")
+            # Reordenar columnas para que CLIENTE esté primero
+            cols_reordered = [cliente_col] + [c for c in cols if c != cliente_col]
+            df = df[cols_reordered]
+            cols = list(df.columns)
+            normalized_map = {nk(c): c for c in cols}
+            cliente_col = normalized_map['CLIENTE']
+            cliente_index = 0
 
 
 
@@ -2488,8 +2704,27 @@ def process_evidencias_pendientes(file_path: str, db: object, username: Optional
         # Keep original header names for MesX
         selected_month_cols = month_cols[:4]
 
+        # Filtrar filas donde la columna CLIENTE esté vacía o sea NULL
+        if df.shape[0] > 0:
+            before_filter = len(df)
+            try:
+                # Filtrar filas con cliente no nulo y no vacío
+                non_empty_cliente = df[cliente_col].notnull() & (df[cliente_col].astype(str).str.strip() != '')
+                df = df[non_empty_cliente]
+                after_filter = len(df)
+                dropped_empty = before_filter - after_filter
+                if dropped_empty > 0:
+                    logging.getLogger('operations').info(f"EvidenciasPendientes: omitidas {dropped_empty} filas con columna CLIENTE vacía")
+            except Exception as filter_err:
+                logging.getLogger('operations').warning(f"No se pudo filtrar filas vacías de CLIENTE: {filter_err}")
+        
         records = df.to_dict(orient='records')
         processed_count = len(records)
+        
+        # Log de muestra de los primeros registros para debug
+        if len(records) > 0:
+            sample_rec = records[0]
+            logging.getLogger('operations').info(f"Primer registro de ejemplo - Cliente: '{sample_rec.get(cliente_col)}', Columnas mes: {list(sample_rec.keys())[:5]}")
 
         insert_sql = (
             "INSERT INTO dbo.evidencias_pendientes_tmp (Cliente, Mes1, Total_Mes1, Mes2, Total_Mes2, Mes3, Total_Mes3, Mes4, Total_Mes4, Total_General, Usuario_Creacion) "
@@ -2524,6 +2759,12 @@ def process_evidencias_pendientes(file_path: str, db: object, username: Optional
                 cval = cval.replace('\xa0', ' ').strip()
                 if cval == '':
                     cval = None
+            
+            # Skip rows where Cliente is None (aunque ya deberían estar filtradas)
+            if cval is None:
+                logging.getLogger('operations').debug(f"Saltando fila {idx} con Cliente NULL")
+                continue
+                
             params['Cliente'] = cval
 
          
@@ -2691,17 +2932,11 @@ def process_pronostico_cobranza(file_path: str, db: object, username: Optional[s
         if sheet_to_use is None:
             raise ValueError("Hoja 'TABLA NUEVA' no encontrada en el archivo Excel")
 
-        try:
-            df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=0)
-            logging.getLogger('operations').info(f"Reading pronostico cobranza sheet '{sheet_to_use}' with header=0")
-        except Exception as read_err:
-            logging.getLogger('operations').error(f"No se pudo leer la hoja TABLA NUEVA: {read_err}")
-            raise
-
-        df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
-        df = df.where(pd.notnull(df), None)
-
-        # Normalize header keys
+        # Buscar la fila y columnas que contienen los encabezados
+        # Leer sin encabezado para buscar en todas las celdas
+        df_search = pd.read_excel(file_path, sheet_name=sheet_to_use, header=None)
+        
+        # Normalizar función para búsqueda
         def nk(s: str) -> str:
             if s is None:
                 return ''
@@ -2709,27 +2944,117 @@ def process_pronostico_cobranza(file_path: str, db: object, username: Optional[s
             ss = unicodedata.normalize('NFKD', ss)
             ss = ''.join(c for c in ss if not unicodedata.combining(c))
             return re.sub(r"\s+", " ", ss).strip().upper()
+        
+        # Buscar "Etiquetas de fila" en las primeras 20 filas y columnas
+        etiquetas_row = None
+        etiquetas_col_idx = None
+        total_general_col_idx = None
+        max_search_rows = min(20, len(df_search))
+        max_search_cols = min(20, df_search.shape[1])
+        
+        for row_idx in range(max_search_rows):
+            for col_idx in range(max_search_cols):
+                cell_value = df_search.iloc[row_idx, col_idx]
+                if cell_value is not None and 'ETIQUETAS' in nk(str(cell_value)) and 'FILA' in nk(str(cell_value)):
+                    etiquetas_row = row_idx
+                    etiquetas_col_idx = col_idx
+                    logging.getLogger('operations').info(f"Encontrado 'Etiquetas de fila' en fila {etiquetas_row} (0-based), columna {etiquetas_col_idx} (0-based)")
+                    
+                    # Buscar "Total general" en la misma fila para determinar el rango de columnas
+                    for end_col_idx in range(col_idx + 1, min(col_idx + 20, df_search.shape[1])):
+                        end_cell = df_search.iloc[row_idx, end_col_idx]
+                        if end_cell is not None and 'TOTAL' in nk(str(end_cell)) and 'GENERAL' in nk(str(end_cell)):
+                            total_general_col_idx = end_col_idx
+                            logging.getLogger('operations').info(f"Encontrado 'Total general' en columna {total_general_col_idx} (0-based)")
+                            break
+                    break
+            if etiquetas_row is not None:
+                break
+        
+        if etiquetas_row is None:
+            raise ValueError("No se encontró la celda con texto 'Etiquetas de fila' en la hoja TABLA NUEVA")
+        
+        if total_general_col_idx is None:
+            logging.getLogger('operations').warning("No se encontró 'Total general', usando todas las columnas desde 'Etiquetas de fila'")
+            total_general_col_idx = df_search.shape[1] - 1
+        
+        # Construir lista de columnas a leer (desde etiquetas_col_idx hasta total_general_col_idx inclusive)
+        cols_to_read = list(range(etiquetas_col_idx, total_general_col_idx + 1))
+        
+        # Leer usando header=etiquetas_row para que esa fila sea el encabezado
+        try:
+            df = pd.read_excel(
+                file_path, 
+                sheet_name=sheet_to_use, 
+                header=etiquetas_row,
+                usecols=cols_to_read
+            )
+            logging.getLogger('operations').info(f"Leyendo pronostico cobranza: encabezado en fila Excel {etiquetas_row + 1} (0-based: {etiquetas_row}), datos desde fila Excel {etiquetas_row + 2}, columnas {etiquetas_col_idx} a {total_general_col_idx}")
+            logging.getLogger('operations').info(f"Columnas leídas: {list(df.columns)}")
+        except Exception as read_err:
+            logging.getLogger('operations').error(f"No se pudo leer con usecols: {read_err}")
+            # Fallback sin usecols
+            df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=etiquetas_row)
+            # Recortar columnas manualmente
+            if etiquetas_col_idx > 0 or total_general_col_idx < df.shape[1] - 1:
+                df = df.iloc[:, etiquetas_col_idx:total_general_col_idx + 1]
+                logging.getLogger('operations').info(f"Recortadas columnas en fallback: {list(df.columns)}")
+
+        df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
+        df = df.where(pd.notnull(df), None)
+
+        # Filtrar filas: detener antes de encontrar una fila cuya primera columna contenga "Total general"
+        if df.shape[1] > 0:
+            first_col = df.columns[0]
+            rows_to_keep = []
+            for idx, row in df.iterrows():
+                first_val = row[first_col]
+                if first_val is not None and 'TOTAL' in nk(str(first_val)) and 'GENERAL' in nk(str(first_val)):
+                    logging.getLogger('operations').info(f"Encontrada fila de 'Total general' en índice {idx}, deteniendo lectura de datos")
+                    break
+                rows_to_keep.append(idx)
+            df = df.loc[rows_to_keep]
+
+        # Omitir filas donde la primera columna esté vacía
+        if df.shape[1] > 0:
+            first_col = df.columns[0]
+            before_count = len(df)
+            try:
+                non_empty_mask = df[first_col].notnull() & (df[first_col].astype(str).str.strip() != '')
+            except Exception:
+                non_empty_mask = df[first_col].notnull()
+            df = df[non_empty_mask]
+            after_count = len(df)
+            dropped = before_count - after_count
+            if dropped > 0:
+                logging.getLogger('operations').info(f"PronosticoCobranza: omitidas {dropped} filas con primera columna vacía")
+
+        records = df.to_dict(orient='records')
+        processed_count = len(records)
+        
+        # Log de muestra del primer registro
+        if len(records) > 0:
+            sample_rec = records[0]
+            logging.getLogger('operations').info(f"Primer registro de ejemplo - Primera columna: '{sample_rec.get(df.columns[0])}', Columnas: {list(sample_rec.keys())}")
 
         cols = list(df.columns)
         normalized_map = {nk(c): c for c in cols}
 
-        # Prefer explicit CLIENTE header; otherwise use the first physical column as CLIENTE
-        if 'CLIENTE' in normalized_map:
-            cliente_col = normalized_map['CLIENTE']
-        else:
-            # map the first physical column to CLIENTE when the header is missing
-            cliente_col = cols[0]
-            logging.getLogger('operations').info(f"No se encontró columna 'CLIENTE' en TABLA NUEVA; usando primera columna '{cliente_col}' como CLIENTE")
+        # La primera columna es el cliente (Etiquetas de fila)
+        cliente_col = cols[0]
+        cliente_index = 0
 
-        cliente_index = cols.index(cliente_col)
-
-        # Week columns are the columns after the cliente column
+        # Las columnas de semanas son las columnas después de la primera (cliente), excluyendo la última si es Total general
         week_cols = cols[cliente_index + 1:]
-        # Keep only non-empty header names
+        # La última columna debe ser Total general, excluirla de las semanas
+        if len(week_cols) > 0 and 'TOTAL' in nk(week_cols[-1]) and 'GENERAL' in nk(week_cols[-1]):
+            total_general_col = week_cols[-1]
+            week_cols = week_cols[:-1]
+        else:
+            total_general_col = None
+        
+        # Filtrar columnas vacías
         week_cols = [c for c in week_cols if c is not None and str(c).strip() != '']
-
-        records = df.to_dict(orient='records')
-        processed_count = len(records)
 
         insert_sql = (
             "INSERT INTO dbo.pronostico_cobranza_tmp (Cliente, Semana1, Total_Semana1, Semana2, Total_Semana2, Semana3, Total_Semana3, Semana4, Total_Semana4, Semana5, Total_Semana5, Semana6, Total_Semana6, Semana7, Total_Semana7, Semana8, Total_Semana8, Semana9, Total_Semana9, Semana10, Total_Semana10, Semana11, Total_Semana11, Semana12, Total_Semana12, Semana13, Total_Semana13, Total_General, Usuario_Creacion, Fecha_Creacion) "
@@ -2737,13 +3062,6 @@ def process_pronostico_cobranza(file_path: str, db: object, username: Optional[s
         )
 
         total_inserted = 0
-
-        # detect explicit Total general column if present
-        total_general_col = None
-        for k_norm, k in normalized_map.items():
-            if 'TOTAL' in k_norm and 'GENERAL' in k_norm:
-                total_general_col = k
-                break
 
         for idx, rec in enumerate(records, start=1):
             params = {

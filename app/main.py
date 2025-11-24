@@ -156,8 +156,8 @@ async def procesar_excel(file: UploadFile = File(...), current_user: models.Usua
             try:
 
                 # Comprobar tanto el nombre sin extensión como el filename completo
-                sql_check = "SELECT TOP 1 nombre_usuario, fecha FROM dbo.mi_bitacora_operaciones WHERE name_file_load = :n1 OR name_file_load = :n2 ORDER BY fecha DESC"
-                row = _db_check.execute(text(sql_check), {"n1": name_only, "n2": filename}).fetchone()
+                #sql_check = "SELECT TOP 1 nombre_usuario, fecha FROM dbo.mi_bitacora_operaciones WHERE name_file_load = :n1 OR name_file_load = :n2 ORDER BY fecha DESC"
+                row = 0 #_db_check.execute(text(sql_check), {"n1": name_only, "n2": filename}).fetchone()
                 if row is not None:
                     proc_user = row[0]
                     proc_fecha = row[1]
