@@ -11,3 +11,4 @@ python-multipart
 argon2_cffi
 python-multipart
 openpyxl
+httpx

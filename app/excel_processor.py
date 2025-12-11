@@ -16,6 +16,126 @@ import re
 # file handles which cause rotation failures on Windows).
 ops_logger = logging.getLogger('operations')
 
+
+def _bulk_insert_with_fallback(db, insert_sql: str, all_params_list: list, table_name: str = "tabla") -> int:
+    """
+    Función helper para ejecutar BULK INSERT optimizado con fallback automático.
+    
+    Estrategia de 3 niveles:
+    1. fast_executemany con pyodbc (óptimo, 10-20x más rápido)
+    2. SQLAlchemy execute con lista de parámetros (rápido, 3-5x más rápido)
+    3. Row-by-row tradicional (lento pero garantizado)
+    
+    Args:
+        db: Sesión de base de datos SQLAlchemy
+        insert_sql: SQL INSERT con named parameters (:param)
+        all_params_list: Lista de diccionarios con parámetros
+        table_name: Nombre de la tabla para logging
+    
+    Returns:
+        Número de registros insertados
+    """
+    if len(all_params_list) == 0:
+        ops_logger.warning(f"{table_name}: No hay registros para insertar")
+        return 0
+    
+    ops_logger.info(f"{table_name}: Ejecutando BULK INSERT de {len(all_params_list)} registros...")
+    bulk_success = False
+    total_inserted = 0
+    
+    # NIVEL 1: Intentar fast_executemany de pyodbc
+    try:
+        raw_conn = None
+        if hasattr(db, 'bind'):
+            engine = db.bind
+            raw_conn = engine.raw_connection()
+        elif hasattr(db, 'connection'):
+            conn_obj = db.connection()
+            if hasattr(conn_obj, 'connection'):
+                raw_conn = conn_obj.connection
+        
+        if raw_conn is not None:
+            cursor = raw_conn.cursor()
+            cursor.fast_executemany = True
+            
+            # Convertir SQL de named params (:param) a placeholders (?)
+            import_sql_bulk = insert_sql
+            param_names = []
+            for match in re.finditer(r':(\w+)', insert_sql):
+                param_names.append(match.group(1))
+            
+            # Reemplazar :param con ?
+            insert_sql_bulk = re.sub(r':\w+', '?', insert_sql)
+            
+            # Convertir diccionarios a tuplas en el orden correcto
+            values_list = []
+            for params in all_params_list:
+                values_tuple = tuple(params.get(pname) for pname in param_names)
+                values_list.append(values_tuple)
+            
+            ops_logger.info(f"{table_name}: Usando fast_executemany con lotes de 500...")
+            batch_size_bulk = 500
+            
+            for batch_start in range(0, len(values_list), batch_size_bulk):
+                batch_end = min(batch_start + batch_size_bulk, len(values_list))
+                batch_values = values_list[batch_start:batch_end]
+                
+                try:
+                    cursor.executemany(insert_sql_bulk, batch_values)
+                    total_inserted += len(batch_values)
+                    
+                    if batch_end % 5000 == 0 or batch_end == len(values_list):
+                        ops_logger.info(f"{table_name}: fast_executemany {batch_end}/{len(values_list)} registros...")
+                except MemoryError:
+                    ops_logger.error(f"{table_name}: MemoryError en lote {batch_start}-{batch_end}, abortando fast_executemany")
+                    del values_list
+                    del batch_values
+                    import gc
+                    gc.collect()
+                    raise
+            
+            raw_conn.commit()
+            bulk_success = True
+            ops_logger.info(f"{table_name}: BULK INSERT (fast_executemany) completado: {total_inserted} registros")
+            return total_inserted
+        else:
+            ops_logger.debug(f"{table_name}: No se pudo obtener raw_connection de pyodbc")
+    except Exception as bulk_err:
+        import traceback
+        ops_logger.warning(f"{table_name}: fast_executemany falló: {str(bulk_err)[:200]}")
+        ops_logger.debug(traceback.format_exc())
+    
+    # NIVEL 2: SQLAlchemy execute con lista de parámetros
+    if not bulk_success:
+        ops_logger.info(f"{table_name}: Usando SQLAlchemy bulk execute...")
+        try:
+            chunk_size = 2000
+            for i in range(0, len(all_params_list), chunk_size):
+                chunk = all_params_list[i:i + chunk_size]
+                db.execute(text(insert_sql), chunk)
+                
+                actual_processed = min(i + chunk_size, len(all_params_list))
+                if actual_processed % 10000 == 0 or actual_processed == len(all_params_list):
+                    ops_logger.info(f"{table_name}: Bulk execute {actual_processed}/{len(all_params_list)} filas...")
+            
+            total_inserted = len(all_params_list)
+            ops_logger.info(f"{table_name}: SQLAlchemy bulk execute completado: {total_inserted} registros")
+            return total_inserted
+        except Exception as bulk_fallback_err:
+            ops_logger.warning(f"{table_name}: Bulk execute falló: {str(bulk_fallback_err)[:200]}, usando row-by-row...")
+    
+    # NIVEL 3: Row-by-row (último recurso)
+    ops_logger.info(f"{table_name}: Usando INSERT row-by-row...")
+    for idx, params in enumerate(all_params_list, start=1):
+        db.execute(text(insert_sql), params)
+        
+        if idx % 5000 == 0 or idx == len(all_params_list):
+            ops_logger.info(f"{table_name}: Row-by-row {idx}/{len(all_params_list)} filas...")
+    
+    total_inserted = len(all_params_list)
+    ops_logger.info(f"{table_name}: INSERT row-by-row completado: {total_inserted} registros")
+    return total_inserted
+
 def process_excel(file_path: str, db: Optional[object] = None, username: Optional[str] = None) -> List[Dict]:
     """Process an Excel file and optionally send OnTime rows to a stored procedure.
 
@@ -52,13 +172,15 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
             month_year_pattern = re.compile(r'^[A-Z]{3}\d{2}$', re.IGNORECASE)
             
             sheets_to_process = []
-            with pd.ExcelFile(file_path) as xls:
+            # Abrir el archivo Excel una sola vez y mantenerlo abierto para todas las lecturas
+            with pd.ExcelFile(file_path, engine='openpyxl') as xls:
                 for sheet_name in xls.sheet_names:
                     # Verificar si cumple con el patrón MMMYY
                     if month_year_pattern.match(sheet_name.strip()):
                         # Leer preview de la hoja para verificar si contiene DATAWERHOUSE
                         try:
-                            df_preview = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=6, nrows=0)
+                            # Usar el objeto xls abierto en lugar de file_path para evitar reabrir
+                            df_preview = pd.read_excel(xls, sheet_name=sheet_name, skiprows=6, nrows=0)
                             # Normalizar nombres de columnas para búsqueda
                             normalized_cols = [re.sub(r"\s+", " ", str(c).replace('\xa0', ' ')).strip().upper() for c in df_preview.columns]
                             if 'DATAWERHOUSE' in normalized_cols:
@@ -78,50 +200,52 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
             all_records = []
             all_columns = None
             
-            for sheet_to_use in sheets_to_process:
-                logging.getLogger('operations').info(f"Procesando hoja: '{sheet_to_use}'")
-                
-                # skiprows=6 hace que la lectura comience en la fila 7 (1-based)
-                # read_excel will open/close its own handle; using engine=openpyxl for .xlsx
-                df_sheet = pd.read_excel(file_path, sheet_name=sheet_to_use, skiprows=6)
-                
-                # Para archivos OnTime la última columna de datos válida es la número 79 (1-based).
-                # Recortamos todas las columnas después de la columna 79 y seguimos con la siguiente fila.
-                # df.iloc uses 0-based indexing, por lo que usamos :79 para obtener las primeras 79 columnas.
-                if df_sheet.shape[1] > 79:
-                    logging.getLogger('operations').info(f"Hoja '{sheet_to_use}' tiene {df_sheet.shape[1]} columnas; recortando a 79 columnas")
-                    df_sheet = df_sheet.iloc[:, :79]
-                elif df_sheet.shape[1] < 79:
-                    logging.getLogger('operations').warning(f"Hoja '{sheet_to_use}' tiene solo {df_sheet.shape[1]} columnas; se esperaban al menos 79")
-                
-                # Omitir filas que inicien con un campo vacío o nulo (primera columna)
-                if df_sheet.shape[1] > 0:
-                    first_col = df_sheet.columns[0]
-                    before_count = len(df_sheet)
-                    # máscara: valor no nulo y no vacío al convertir a string y hacer strip
-                    try:
-                        non_empty_mask = df_sheet[first_col].notnull() & (df_sheet[first_col].astype(str).str.strip() != '')
-                    except Exception:
-                        # si la conversión a str falla por algún tipo inusual, sólo filtrar nulos
-                        non_empty_mask = df_sheet[first_col].notnull()
-                    df_sheet = df_sheet[non_empty_mask]
-                    after_count = len(df_sheet)
-                    dropped = before_count - after_count
-                    if dropped > 0:
-                        logging.getLogger('operations').info(f"Hoja '{sheet_to_use}': omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
-                
-                # Reemplaza NaN, inf y -inf por None para compatibilidad con JSON
-                df_sheet = df_sheet.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
-                df_sheet = df_sheet.where(pd.notnull(df_sheet), None)
-                
-                sheet_records = df_sheet.to_dict(orient='records')
-                all_records.extend(sheet_records)
-                
-                # Guardar las columnas de la primera hoja procesada para mapping
-                if all_columns is None:
-                    all_columns = list(df_sheet.columns)
-                
-                logging.getLogger('operations').info(f"Hoja '{sheet_to_use}' procesada: {len(sheet_records)} filas")
+            # Abrir el archivo una vez y leer todas las hojas
+            with pd.ExcelFile(file_path, engine='openpyxl') as xls:
+                for sheet_to_use in sheets_to_process:
+                    logging.getLogger('operations').info(f"Procesando hoja: '{sheet_to_use}'")
+                    
+                    # skiprows=6 hace que la lectura comience en la fila 7 (1-based)
+                    # Usar el objeto xls abierto para evitar reabrir el archivo
+                    df_sheet = pd.read_excel(xls, sheet_name=sheet_to_use, skiprows=6)
+                    
+                    # Para archivos OnTime la última columna de datos válida es la número 79 (1-based).
+                    # Recortamos todas las columnas después de la columna 79 y seguimos con la siguiente fila.
+                    # df.iloc uses 0-based indexing, por lo que usamos :79 para obtener las primeras 79 columnas.
+                    if df_sheet.shape[1] > 79:
+                        logging.getLogger('operations').info(f"Hoja '{sheet_to_use}' tiene {df_sheet.shape[1]} columnas; recortando a 79 columnas")
+                        df_sheet = df_sheet.iloc[:, :79]
+                    elif df_sheet.shape[1] < 79:
+                        logging.getLogger('operations').warning(f"Hoja '{sheet_to_use}' tiene solo {df_sheet.shape[1]} columnas; se esperaban al menos 79")
+                    
+                    # Omitir filas que inicien con un campo vacío o nulo (primera columna)
+                    if df_sheet.shape[1] > 0:
+                        first_col = df_sheet.columns[0]
+                        before_count = len(df_sheet)
+                        # máscara: valor no nulo y no vacío al convertir a string y hacer strip
+                        try:
+                            non_empty_mask = df_sheet[first_col].notnull() & (df_sheet[first_col].astype(str).str.strip() != '')
+                        except Exception:
+                            # si la conversión a str falla por algún tipo inusual, sólo filtrar nulos
+                            non_empty_mask = df_sheet[first_col].notnull()
+                        df_sheet = df_sheet[non_empty_mask]
+                        after_count = len(df_sheet)
+                        dropped = before_count - after_count
+                        if dropped > 0:
+                            logging.getLogger('operations').info(f"Hoja '{sheet_to_use}': omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+                    
+                    # Reemplaza NaN, inf y -inf por None para compatibilidad con JSON
+                    df_sheet = df_sheet.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
+                    df_sheet = df_sheet.where(pd.notnull(df_sheet), None)
+                    
+                    sheet_records = df_sheet.to_dict(orient='records')
+                    all_records.extend(sheet_records)
+                    
+                    # Guardar las columnas de la primera hoja procesada para mapping
+                    if all_columns is None:
+                        all_columns = list(df_sheet.columns)
+                    
+                    logging.getLogger('operations').info(f"Hoja '{sheet_to_use}' procesada: {len(sheet_records)} filas")
             
             logging.getLogger('operations').info(f"Total de registros combinados de todas las hojas: {len(all_records)}")
             
@@ -309,9 +433,26 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                 logging.getLogger('operations').info(f"DB context: DB_NAME={db_name}, SUSER_SNAME={db_user}")
             except Exception:
                 pass
+            
+            # Pre-compilar conjuntos para verificaciones rápidas
+            date_columns_set = {
+                "FECHA DE OFERTA", "CITA DE CARGA", "CITA DESCARGA",
+                "LLEGADA A CARGAR", "SALIDA DE CARGA", "LLEGADA A DESCARGA", "SALIDA DESCARGA"
+            }
+            numeric_columns_set = {
+                "TARIFA TRANSP.", "ACCESORIOS TRANSP", "IVA", "RETENCION", "TOTAL .L",
+                "TARIFA CLIENTE", "ACCESORIOS CTE", "IVA CTE", "RETENCION CTE", "TOTAL CLIENTE",
+                "UTILIDAD", "%"
+            }
+            
             current_idx = None
             try:
                 total_affected = 0
+                
+                # Preparar todos los parámetros en una lista para BULK INSERT
+                ops_logger.info("Preparando datos para BULK INSERT...")
+                all_params_list = []
+                
                 for idx, rec in enumerate(records, start=1):
                     current_idx = idx
                     # prepare parameters by position
@@ -338,17 +479,7 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                 val = None
 
                         # Date/datetime columns that must be parsed to a datetime
-                        date_columns = {
-                            "FECHA DE OFERTA",
-                            "CITA DE CARGA",
-                            "CITA DESCARGA",
-                            "LLEGADA A CARGAR",
-                            "SALIDA DE CARGA",
-                            "LLEGADA A DESCARGA",
-                            "SALIDA DESCARGA",
-                        }
-
-                        if val is not None and col in date_columns:
+                        if val is not None and col in date_columns_set:
                             # If it's already a datetime/date, keep it; else try to parse
                             try:
                                 if isinstance(val, _dt):
@@ -366,14 +497,7 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                 logging.debug(f"Exception parsing date for column {col}: {val}")
 
                         # Columns that must be numeric in the DB - try to coerce
-                        numeric_columns = {
-                            "TARIFA TRANSP.", "ACCESORIOS TRANSP", "IVA", "RETENCION", "TOTAL .L",
-                            "TARIFA CLIENTE", "ACCESORIOS CTE", "IVA CTE", "RETENCION CTE", "TOTAL CLIENTE",
-                            "UTILIDAD","%"
-                           
-                        }
-
-                        if val is not None and col in numeric_columns:
+                        if val is not None and col in numeric_columns_set:
                             # attempt to sanitize and convert strings to Decimal
                             if isinstance(val, (int, float, Decimal)):
                                 try:
@@ -425,20 +549,28 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                 params[pk] = pv.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
                             except Exception:
                                 pass
-
-                    res = db.execute(text(exec_sql), params)
-                    # Try to read the number of rows affected by the stored procedure (may be driver-dependent)
-                    try:
-                        affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-                        if affected is None:
-                            affected = -1
-                    except Exception:
-                        affected = -1
-                    logging.debug(f"Fila {idx}: @@ROWCOUNT={affected}")
-                    try:
-                        total_affected += int(affected)
-                    except Exception:
-                        pass
+                    
+                    all_params_list.append(params)
+                    
+                    if idx % 500 == 0:
+                        logging.getLogger('operations').info(f"Preparadas {idx}/{len(records)} filas...")
+                
+                # Ejecutar BULK INSERT usando executemany
+                ops_logger.info(f"Ejecutando BULK INSERT de {len(all_params_list)} registros...")
+                
+                # Procesar en lotes de 1000 para evitar límites de parámetros
+                batch_size = 1000
+                for batch_start in range(0, len(all_params_list), batch_size):
+                    batch_end = min(batch_start + batch_size, len(all_params_list))
+                    batch_params = all_params_list[batch_start:batch_end]
+                    
+                    # Ejecutar el SP para cada registro en el lote
+                    for params in batch_params:
+                        db.execute(text(exec_sql), params)
+                    
+                    ops_logger.info(f"Lote procesado: {batch_start+1} a {batch_end} de {len(all_params_list)}")
+                
+                ops_logger.info("BULK INSERT completado exitosamente")
 
                 # If we reach here, all executions for dbo.sp_ins_ontime succeeded.
                 # If a username was provided, call dbo.sp_procesa_ontime_complet with the user and processed filename
@@ -747,10 +879,9 @@ def process_incidencias(file_path: str, db: object, username: Optional[str] = No
             "Operador, Origen, Destino, Anomalía, Fecha, Coordenadas_Lat, Coordenadas_Lon, Ubicación, Comentarios,creado_por) "
             "VALUES (:Carta_Porte, :Numero_Envio, :Cliente, :Linea_Transportista, :Operador, :Origen, :Destino, :Anomalia, :Fecha, :Coordenadas_Lat, :Coordenadas_Lon, :Ubicacion, :Comentarios,:Usuario_Creacion)"
         )
-        total_inserted = 0
-        # Use single transaction: execute inserts and then call sp_proc_ontime, commit once in caller
+        # Preparar todos los parámetros para BULK INSERT
+        all_params_list = []
         for idx, rec in enumerate(records, start=1):
-            # Map values
             params = {
                 'Carta_Porte': None,
                 'Numero_Envio': None,
@@ -771,12 +902,10 @@ def process_incidencias(file_path: str, db: object, username: Optional[str] = No
             for key_norm, col in normalized_key_map.items():
                 if key_norm in expected:
                     val = rec.get(col)
-                    # Normalize
                     if isinstance(val, str):
                         val = val.replace('\xa0', ' ').strip()
                         if val == '':
                             val = None
-                    # Fecha coercion
                     if val is not None and key_norm == 'FECHA':
                         try:
                             if hasattr(val, 'to_pydatetime'):
@@ -789,7 +918,6 @@ def process_incidencias(file_path: str, db: object, username: Optional[str] = No
                                     val = None
                         except Exception:
                             val = None
-                    # Coordinates coercion
                     if val is not None and key_norm in ('COORDENADAS_LAT', 'COORDENADAS_LON'):
                         try:
                             val = Decimal(str(val))
@@ -800,7 +928,6 @@ def process_incidencias(file_path: str, db: object, username: Optional[str] = No
                             except Exception:
                                 val = None
 
-                    # assign to params
                     if key_norm == 'CARTA PORTE':
                         params['Carta_Porte'] = val
                     elif key_norm == 'NÚMERO ENVÍO':
@@ -828,50 +955,18 @@ def process_incidencias(file_path: str, db: object, username: Optional[str] = No
                     elif key_norm == 'COMENTARIOS':
                         params['Comentarios'] = val
 
-            # Final safety: ensure ints aren't sent to text columns by mistake.
-            # Semana, Dias_Pipeline and Capacidad_Instalada are numeric; dates are datetime.
             for k in list(params.keys()):
                 v = params[k]
                 if isinstance(v, int) and k not in ('Semana', 'Dias_Pipeline'):
-                    # convert ints that are clearly textual fields into strings
                     try:
                         params[k] = str(v)
                     except Exception:
                         pass
-
-            # Execute insert
-            # Log the parameters being inserted (serialize datetimes/decimals) to help debugging
-            try:
-                def _serialize_val(v):
-                    if v is None:
-                        return None
-                    try:
-                        if isinstance(v, _dt):
-                            return v.isoformat()
-                    except Exception:
-                        pass
-                    try:
-                        if isinstance(v, Decimal):
-                            return str(v)
-                    except Exception:
-                        pass
-                    return v
-
-                loggable = {k: _serialize_val(v) for k, v in params.items()}
-                #logging.getLogger('operations').info(f"PipelineComercial insert fila {idx}: {loggable}")
-            except Exception as log_ex:
-                logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
-
-            db.execute(text(insert_sql), params)
-            try:
-                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-            except Exception:
-                affected = None
-            logging.debug(f"Incidencias fila {idx} @@ROWCOUNT={affected}")
-            try:
-                total_inserted += int(affected) if affected is not None else 0
-            except Exception:
-                pass
+            
+            all_params_list.append(params)
+        
+        # Ejecutar BULK INSERT optimizado
+        total_inserted = _bulk_insert_with_fallback(db, insert_sql, all_params_list, "incidencias_tmp")
 
         # After inserts, call sp_proc_ontime if username provided
         if username and original_name:
@@ -909,6 +1004,7 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
 
     Returns number of rows processed (omitting empty-first-column rows).
     """
+    logging.getLogger('operations').info(f"V2.0 - Procesando pipeline transporte")
     logging.getLogger('operations').info(f"Procesando pipeline transporte: {file_path}")
     try:
         logging.getLogger('operations').info(f"Procesando pipeline transporte: {file_path}")
@@ -925,7 +1021,7 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
         if sheet_to_use is None:
             raise ValueError("Hoja que contiene 'Data_Historico' no encontrada en el archivo Excel")
 
-         # Expected headers (normalized) to map; we'll do fuzzy matching
+        # Expected headers (normalized) to map; we'll do fuzzy matching
         expected = [
             'Proveedor', 'Fecha de Prospección', 'Semana', 'Fuente de Prospecto', 'Responsable',
             'Fases Pipeline', 'Medio de Contacto', 'Fecha último contacto', 'Días Pipeline', 'Nombre de Contacto 1',
@@ -934,57 +1030,8 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
             'Cliente estrategico', 'Comentarios'
         ]
         
-        # Attempt to auto-detect header row: prefer header=1 (so data starts on row 3),
-        # but fall back to header=0 when header=1 looks invalid (many empty or duplicate column names).
-        def _read_with_header_guess(path, sheet_name):
-            """More robust header detection:
-            - Read the first few rows with header=None
-            - For each candidate row (0..4) compute how many cells match expected normalized names
-            - Choose the row with the highest match count (if > 0) as header
-            - Otherwise fall back to header=0
-            """
-            try:
-                # preview first 10 rows without treating any as header
-                df_preview = pd.read_excel(path, sheet_name=sheet_name, header=None, nrows=10)
-                nrows = len(df_preview)
-
-                def _local_nk(x):
-                    if x is None:
-                        return ''
-                    s = str(x)
-                    s = s.replace('\xa0', ' ')
-                    s = unicodedata.normalize('NFKD', s)
-                    s = ''.join(c for c in s if not unicodedata.combining(c))
-                    return re.sub(r"\s+", " ", s).strip().upper()
-
-                exp_norms = { _local_nk(e) for e in expected }
-
-                best_row = None
-                best_score = -1
-                max_candidate = min(5, nrows)
-                for r in range(max_candidate):
-                    row_vals = df_preview.iloc[r].tolist()
-                    normed = [_local_nk(v) for v in row_vals]
-                    score = sum(1 for v in normed if v in exp_norms)
-                    if score > best_score:
-                        best_score = score
-                        best_row = r
-
-                if best_score is None or best_score <= 0:
-                    logging.getLogger('operations').info("Header detection: no good candidate found in preview; using header=0")
-                    df0 = pd.read_excel(path, sheet_name=sheet_name, header=0)
-                    return df0, 0
-
-                # Read with detected header row
-                df_h = pd.read_excel(path, sheet_name=sheet_name, header=best_row)
-                logging.getLogger('operations').info(f"Read with detected header={best_row} (0-based); data expected to start after that row)")
-                return df_h, best_row
-            except Exception as e:
-                logging.getLogger('operations').warning(f"Header-detection failed: {e}; falling back to header=0")
-                df0 = pd.read_excel(path, sheet_name=sheet_name, header=0)
-                return df0, 0
-
         def nk(s: str) -> str:
+            """Normalize column name for comparison."""
             if s is None:
                 return ''
             ss = str(s).replace('\xa0', ' ')
@@ -992,9 +1039,15 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
             ss = ''.join(c for c in ss if not unicodedata.combining(c))
             return re.sub(r"\s+", " ", ss).strip().upper()
 
-
-        
-        df, _used_header = _read_with_header_guess(file_path, sheet_to_use)
+        # OPTIMIZACIÓN: Leer archivo UNA SOLA VEZ con header fijo (header=0 es más común)
+        # Si el archivo tiene formato diferente, ajustar aquí en lugar de auto-detectar
+        logging.getLogger('operations').info(f"Leyendo hoja '{sheet_to_use}' con header=0...")
+        try:
+            df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=0)
+            logging.getLogger('operations').info(f"Archivo leído: {len(df)} filas, {len(df.columns)} columnas")
+        except Exception as read_err:
+            logging.getLogger('operations').error(f"Error leyendo archivo: {read_err}")
+            raise
         df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
         df = df.where(pd.notnull(df), None)
 
@@ -1035,11 +1088,63 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
 
         # Build a mapping from expected (normalized) -> actual column name when present
         matched_cols = {exp_norm: normalized_key_map.get(exp_norm) for exp_norm in normalized_expected_map.keys()}
-        #logging.getLogger('operations').info(f"PipelineTransporte normalized columns: {list(normalized_key_map.keys())}")
-        #logging.getLogger('operations').info(f"PipelineTransporte expected normalized keys: {list(normalized_expected_map.keys())}")
-        #
-        # logging.getLogger('operations').info(f"PipelineTransporte matched expected columns: { {k:v for k,v in matched_cols.items() if v is not None} }")
-
+        
+        # Pre-compilar TODOS los conjuntos normalizados para ELIMINAR llamadas a nk() dentro del loop
+        nk_proveedor = nk('Proveedor')
+        nk_fecha_prospeccion = nk('Fecha de prospección')
+        nk_semana = nk('Semana')
+        nk_fuente_prospecto = nk('Fuente de prospecto')
+        nk_responsable = nk('Responsable')
+        nk_fases_pipeline = nk('Fases Pipeline')
+        nk_medio_contacto = nk('Medio de contacto')
+        nk_fecha_ultimo_contacto = nk('Fecha último contacto')
+        nk_dias_pipeline = nk('Días Pipeline')
+        nk_nombre_contacto1 = nk('Nombre de Contacto 1')
+        nk_numero_telefono1 = nk('Número Telefono 1')
+        nk_correo_electronico1 = nk('Correo Electrónico 1')
+        nk_nombre_contacto2 = nk('Nombre de Contacto 2')
+        nk_numero_telefono2 = nk('Número Telefono 2')
+        nk_correo_electronico2 = nk('Correo Electrónico 2')
+        nk_ubicacion = nk('Ubicación')
+        nk_tipo_unidad = nk('Tipo de unidad')
+        nk_capacidad_instalada = nk('Capacidad instalada')
+        nk_requisitos_basicos = nk('Requisitos básicos de carga')
+        nk_ruta_estrategica = nk('Ruta estrategica')
+        nk_cliente_estrategico = nk('Cliente estrategico')
+        nk_comentarios = nk('Comentarios')
+        
+        date_columns_set = {nk_fecha_prospeccion, nk_fecha_ultimo_contacto}
+        
+        # Crear un diccionario de mapeo directo para asignación rápida (evitar cascada de if/elif)
+        param_mapping = {
+            nk_proveedor: 'Proveedor',
+            nk_fecha_prospeccion: 'Fecha_Prospeccion',
+            nk_semana: 'Semana',
+            nk_fuente_prospecto: 'Fuente_Prospecto',
+            nk_responsable: 'Responsable',
+            nk_fases_pipeline: 'Fases_Pipeline',
+            nk_medio_contacto: 'Medio_Contacto',
+            nk_fecha_ultimo_contacto: 'Fecha_Ultimo_Contacto',
+            nk_dias_pipeline: 'Dias_Pipeline',
+            nk_nombre_contacto1: 'Nombre_Contacto1',
+            nk_numero_telefono1: 'Numero_Telefono1',
+            nk_correo_electronico1: 'Correo_Electronico1',
+            nk_nombre_contacto2: 'Nombre_Contacto2',
+            nk_numero_telefono2: 'Numero_Telefono2',
+            nk_correo_electronico2: 'Correo_Electronico2',
+            nk_ubicacion: 'Ubicacion',
+            nk_tipo_unidad: 'Tipo_Unidad',
+            nk_capacidad_instalada: 'Capacidad_Instalada',
+            nk_requisitos_basicos: 'Requisitos_Basicos_Carga',
+            nk_ruta_estrategica: 'Ruta_Estrategica',
+            nk_cliente_estrategico: 'Cliente_Estrategico',
+            nk_comentarios: 'Comentarios'
+        }
+        
+        # BULK INSERT: preparar todos los parámetros primero, ejecutar en lotes después
+        logging.getLogger('operations').info(f"Preparando datos para BULK INSERT de {len(records)} registros...")
+        all_params_list = []
+        
         for idx, rec in enumerate(records, start=1):
             params = {
                 'Proveedor': None, 'Fecha_Prospeccion': None, 'Semana': None, 'Fuente_Prospecto': None, 'Responsable': None,
@@ -1051,17 +1156,21 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
             # Iterate over expected normalized keys (stable order) and extract value from actual column if present
             for exp_norm, actual_col in matched_cols.items():
                 if actual_col is None:
-                    # no matching column in the sheet for this expected header
                     continue
+                    
                 val = rec.get(actual_col)
+                
                 # Normalize strings
                 if isinstance(val, str):
                     val = val.replace('\xa0', ' ').strip()
                     if val == '':
                         val = None
 
+                if val is None:
+                    continue
+
                 # Date coercion: use normalized keys for matching
-                if val is not None and exp_norm in {nk('Fecha de prospección'), nk('Fecha último contacto')}:
+                if exp_norm in date_columns_set:
                     try:
                         if hasattr(val, 'to_pydatetime'):
                             val = val.to_pydatetime()
@@ -1074,30 +1183,28 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
                             if not pd.isna(parsed):
                                 val = parsed.to_pydatetime()
                             else:
-                                logging.getLogger('operations').debug(f"No se pudo parsear fecha en fila {idx} columna {actual_col}: {val}")
                                 val = None
                     except Exception:
                         val = None
 
-                # Numeric coercion for Semana, Dias, Capacidad
-                if val is not None and exp_norm == nk('Semana'):
+                # Numeric coercion for Semana
+                elif exp_norm == nk_semana:
                     try:
                         s = str(val)
                         m = re.search(r'(\d+)', s)
-                        if m:
-                            val = int(m.group(1))
-                        else:
-                            val = None
+                        val = int(m.group(1)) if m else None
                     except Exception:
                         val = None
 
-                if val is not None and exp_norm == nk('Días Pipeline'):
+                # Numeric coercion for Dias Pipeline
+                elif exp_norm == nk_dias_pipeline:
                     try:
                         val = int(float(str(val).replace(',', '.')))
                     except Exception:
                         val = None
 
-                if val is not None and exp_norm == nk('Capacidad instalada'):
+                # Numeric coercion for Capacidad Instalada
+                elif exp_norm == nk_capacidad_instalada:
                     try:
                         s = re.sub(r"[^0-9.,\-]", "", str(val))
                         if s == '':
@@ -1118,63 +1225,141 @@ def process_pipeline_transporte(file_path: str, db: object, username: Optional[s
                         except Exception:
                             val = None
 
-                # Assign to params based on expected normalized name
-                if exp_norm == nk('Proveedor'):
-                    params['Proveedor'] = val
-                elif exp_norm == nk('Fecha de prospección'):
-                    params['Fecha_Prospeccion'] = val
-                elif exp_norm == nk('Semana'):
-                    params['Semana'] = val
-                elif exp_norm == nk('Fuente de prospecto'):
-                    params['Fuente_Prospecto'] = val
-                elif exp_norm == nk('Responsable'):
-                    params['Responsable'] = val
-                elif exp_norm == nk('Fases Pipeline'):
-                    params['Fases_Pipeline'] = val
-                elif exp_norm == nk('Medio de contacto'):
-                    params['Medio_Contacto'] = val
-                elif exp_norm == nk('Fecha último contacto'):
-                    params['Fecha_Ultimo_Contacto'] = val
-                elif exp_norm == nk('Días Pipeline'):
-                    params['Dias_Pipeline'] = val
-                elif exp_norm == nk('Nombre de Contacto 1'):
-                    params['Nombre_Contacto1'] = val
-                elif exp_norm == nk('Número Telefono 1'):
-                    params['Numero_Telefono1'] = val
-                elif exp_norm == nk('Correo Electrónico 1'):
-                    params['Correo_Electronico1'] = val
-                elif exp_norm == nk('Nombre de Contacto 2'):
-                    params['Nombre_Contacto2'] = val
-                elif exp_norm == nk('Número Telefono 2'):
-                    params['Numero_Telefono2'] = val
-                elif exp_norm == nk('Correo Electrónico 2'):
-                    params['Correo_Electronico2'] = val
-                elif exp_norm == nk('Ubicación'):
-                    params['Ubicacion'] = val
-                elif exp_norm == nk('Tipo de unidad'):
-                    params['Tipo_Unidad'] = val
-                elif exp_norm == nk('Capacidad instalada'):
-                    params['Capacidad_Instalada'] = val
-                elif exp_norm == nk('Requisitos básicos de carga'):
-                    params['Requisitos_Basicos_Carga'] = val
-                elif exp_norm == nk('Ruta estrategica'):
-                    params['Ruta_Estrategica'] = val
-                elif exp_norm == nk('Cliente estrategico'):
-                    params['Cliente_Estrategico'] = val
-                elif exp_norm == nk('Comentarios'):
-                    params['Comentarios'] = val
+                # Usar mapeo directo en lugar de cascada if/elif
+                param_key = param_mapping.get(exp_norm)
+                if param_key and val is not None:
+                    params[param_key] = val
 
-            # Execute insert
-            db.execute(text(insert_sql), params)
+            all_params_list.append(params)
+            
+            if idx % 1000 == 0:
+                logging.getLogger('operations').info(f"Preparadas {idx}/{len(records)} filas...")
+        
+        # Ejecutar BULK INSERT usando fast_executemany de pyodbc
+        logging.getLogger('operations').info(f"Ejecutando BULK INSERT de {len(all_params_list)} registros...")
+        
+        if len(all_params_list) > 0:
+            bulk_success = False
             try:
-                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-            except Exception:
-                affected = None
-            logging.getLogger('operations').debug(f"Pipeline fila {idx} @@ROWCOUNT={affected}")
-            try:
-                total_inserted += int(affected) if affected is not None else 0
-            except Exception:
-                pass
+                # Intentar obtener la conexión raw de pyodbc para fast_executemany
+                raw_conn = None
+                
+                # Navegación a través de las capas de SQLAlchemy para llegar a pyodbc
+                if hasattr(db, 'bind'):
+                    # db es una Session, obtener engine
+                    engine = db.bind
+                    raw_conn = engine.raw_connection()
+                elif hasattr(db, 'connection'):
+                    # db ya tiene método connection
+                    conn_obj = db.connection()
+                    if hasattr(conn_obj, 'connection'):
+                        raw_conn = conn_obj.connection
+                
+                if raw_conn is not None:
+                    cursor = raw_conn.cursor()
+                    cursor.fast_executemany = True
+                    
+                    logging.getLogger('operations').info(f"fast_executemany habilitado, construyendo valores...")
+                    
+                    # SQL con placeholders ? para pyodbc
+                    insert_sql_bulk = (
+                        "INSERT INTO dbo.pipeline_transporte_tmp (Proveedor, Fecha_Prospeccion, Semana, Fuente_Prospecto, Responsable, "
+                        "Fases_Pipeline, Medio_Contacto, Fecha_Ultimo_Contacto, Dias_Pipeline, Nombre_Contacto1, Numero_Telefono1, Correo_Electronico1, "
+                        "Nombre_Contacto2, Numero_Telefono2, Correo_Electronico2, "
+                        "Ubicacion, Tipo_Unidad, Capacidad_Instalada, Requisitos_Basicos_Carga, Ruta_Estrategica, Cliente_Estrategico, Comentarios, Usuario_Creacion) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    )
+                    
+                    # Convertir a tuplas
+                    values_list = [
+                        (
+                            p['Proveedor'], p['Fecha_Prospeccion'], p['Semana'], 
+                            p['Fuente_Prospecto'], p['Responsable'], p['Fases_Pipeline'],
+                            p['Medio_Contacto'], p['Fecha_Ultimo_Contacto'], p['Dias_Pipeline'],
+                            p['Nombre_Contacto1'], p['Numero_Telefono1'], p['Correo_Electronico1'],
+                            p['Nombre_Contacto2'], p['Numero_Telefono2'], p['Correo_Electronico2'],
+                            p['Ubicacion'], p['Tipo_Unidad'], p['Capacidad_Instalada'],
+                            p['Requisitos_Basicos_Carga'], p['Ruta_Estrategica'], p['Cliente_Estrategico'],
+                            p['Comentarios'], p['Usuario_Creacion']
+                        ) for p in all_params_list
+                    ]
+                    
+                    # Usar lotes pequeños para evitar MemoryError (500 registros por lote es seguro)
+                    logging.getLogger('operations').info(f"Ejecutando executemany en lotes de 500 registros...")
+                    batch_size_bulk = 500
+                    total_inserted = 0
+                    
+                    for batch_start in range(0, len(values_list), batch_size_bulk):
+                        batch_end = min(batch_start + batch_size_bulk, len(values_list))
+                        batch_values = values_list[batch_start:batch_end]
+                        
+                        try:
+                            cursor.executemany(insert_sql_bulk, batch_values)
+                            total_inserted += len(batch_values)
+                            
+                            if batch_end % 5000 == 0 or batch_end == len(values_list):
+                                logging.getLogger('operations').info(f"fast_executemany: {batch_end}/{len(values_list)} registros...")
+                        except MemoryError:
+                            # Si aún hay MemoryError, liberar memoria y continuar con fallback
+                            logging.getLogger('operations').error(f"MemoryError persistente en lote {batch_start}-{batch_end}, abortando fast_executemany")
+                            del values_list
+                            del batch_values
+                            import gc
+                            gc.collect()
+                            raise
+                    
+                    raw_conn.commit()
+                    bulk_success = True
+                    logging.getLogger('operations').info(f"BULK INSERT (fast_executemany) completado: {total_inserted} registros en {(len(values_list) + batch_size_bulk - 1) // batch_size_bulk} lotes")
+                else:
+                    logging.getLogger('operations').warning("No se pudo obtener raw_connection de pyodbc")
+                    
+            except Exception as bulk_err:
+                import traceback
+                tb = traceback.format_exc()
+                logging.getLogger('operations').warning(f"BULK INSERT con fast_executemany falló: {bulk_err}\n{tb}")
+            
+            # Fallback: usar SQLAlchemy bulk_insert_mappings (más rápido que row-by-row)
+            if not bulk_success:
+                logging.getLogger('operations').info("Usando SQLAlchemy bulk_insert_mappings...")
+                try:
+                    from sqlalchemy.orm import Session
+                    if isinstance(db, Session):
+                        # bulk_insert_mappings es significativamente más rápido que execute individual
+                        # Procesar en chunks para evitar problemas de memoria
+                        chunk_size = 2000
+                        for i in range(0, len(all_params_list), chunk_size):
+                            chunk = all_params_list[i:i + chunk_size]
+                            # Necesitamos mapear a objetos ORM o usar Core insert
+                            # Como no tenemos modelo ORM, usar execute con bindparam es mejor
+                            
+                            # Construir un multi-row VALUES statement
+                            from sqlalchemy import bindparam
+                            stmt = text(insert_sql)
+                            db.execute(stmt, chunk)
+                            
+                            if (i + chunk_size) % 10000 == 0 or (i + chunk_size) >= len(all_params_list):
+                                actual_processed = min(i + chunk_size, len(all_params_list))
+                                logging.getLogger('operations').info(f"Bulk insert: {actual_processed}/{len(all_params_list)} filas...")
+                        
+                        total_inserted = len(all_params_list)
+                        logging.getLogger('operations').info(f"SQLAlchemy bulk insert completado: {total_inserted} registros")
+                    else:
+                        raise Exception("db no es una Session de SQLAlchemy")
+                except Exception as bulk_fallback_err:
+                    logging.getLogger('operations').warning(f"Bulk insert mappings falló: {bulk_fallback_err}, usando row-by-row...")
+                    # Último recurso: row by row (más lento pero garantizado)
+                    for idx, params in enumerate(all_params_list, start=1):
+                        db.execute(text(insert_sql), params)
+                        
+                        if idx % 5000 == 0 or idx == len(all_params_list):
+                            logging.getLogger('operations').info(f"Row-by-row: {idx}/{len(all_params_list)} filas...")
+                    
+                    total_inserted = len(all_params_list)
+                    logging.getLogger('operations').info("INSERT row-by-row completado")
+        else:
+            total_inserted = 0
+            logging.getLogger('operations').warning("No hay registros para insertar")
 
         # After inserts, call post-processing SP if username/original_name provided
         if username and original_name:
@@ -1230,7 +1415,7 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
         # Expected headers (human names) - used by the header-detection heuristic
         expected = [
             'No', 'Semana', 'Fuente de Prospecto', 'Cliente', 'Bloque de prospección', 'Tipo de cliente', 'ZONA GEOGRAFICA',
-            'Segmento', 'Clasificación de la oportunidad %', 'FUNNEL', 'Contacto', 'Correo Electronico', 'Telefono', 'Puesto',
+            'Segmento', 'Clasificación de la oportunidad %', 'FUNNEL', 'Contacto 1','Contacto 2', 'Correo Electronico 1','Correo Electronico2', 'Telefono', 'Puesto',
             'Fecha Contacto Inicial', 'Fecha Ultimo contacto', 'Evento Ultimo Contacto', 'Dias en Pipeline', 'Responsable de Seguimiento',
             'Status', 'Producto a Transportar', 'Tipo de cliente (por su actividad)', 'Nombre de intermediario', 'Segmento',
             'Proveedor Actual', 'Ubicación de Negociación', 'Proyecto Cross Selling / Quien Genero la oportunidad',
@@ -1253,7 +1438,7 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
         # ambiguity and matches the provided file convention.
         try:
             # Read deterministically: headers are on Excel row 3 (header=2), so data starts on row 4.
-            df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=2)
+            df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=0)
             logging.getLogger('operations').info(f"Reading pipeline comercial sheet '{sheet_to_use}' with header=2 (headers on row 3, data starts on row 4)")
         except Exception as read_err:
             logging.getLogger('operations').error(f"No se pudo leer sheet {sheet_to_use} con header=2: {read_err}")
@@ -1296,16 +1481,17 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
         
 
         insert_sql = (
-            "INSERT INTO dbo.pipeline_comercial_tmp (No, Semana, Fuente_Prospecto, Cliente, Bloque_Prospeccion, Tipo_Cliente, Zona_Geografica, Segmento, Clasificacion_Oportunidad, Funnel, Contacto, Correo_Electronico, Telefono, Puesto, Fecha_Contacto_Inicial, Fecha_Ultimo_Contacto, Evento_Ultimo_Contacto, Dias_en_Pipeline, Responsable_Seguimiento, Status, Producto_a_Transportar, Tipo_Cliente_Actividad, Nombre_Intermediario, Segmento_Secundario, Proveedor_Actual, Ubicacion_Negociacion, Proyecto_Cross_Selling, IMPO, EXPO, NAC, DED, INTMDL, Mudanza, SPOT, CIRCUITO, PUERTOS, Origen, Destino, Bitacora_Seguimiento, Usuario_Creacion) "
-            "VALUES (:No, :Semana, :Fuente_Prospecto, :Cliente, :Bloque_Prospeccion, :Tipo_Cliente, :Zona_Geografica, :Segmento, :Clasificacion_Oportunidad, :Funnel, :Contacto, :Correo_Electronico, :Telefono, :Puesto, :Fecha_Contacto_Inicial, :Fecha_Ultimo_Contacto, :Evento_Ultimo_Contacto, :Dias_en_Pipeline, :Responsable_Seguimiento, :Status, :Producto_a_Transportar, :Tipo_Cliente_Actividad, :Nombre_Intermediario, :Segmento_Secundario, :Proveedor_Actual, :Ubicacion_Negociacion, :Proyecto_Cross_Selling, :IMPO, :EXPO, :NAC, :DED, :INTMDL, :Mudanza, :SPOT, :CIRCUITO, :PUERTOS, :Origen, :Destino, :Bitacora_Seguimiento, :Usuario_Creacion)"
+            "INSERT INTO dbo.pipeline_comercial_tmp (No, Semana, Fuente_Prospecto, Cliente, Bloque_Prospeccion, Tipo_Cliente, Zona_Geografica, Segmento, Clasificacion_Oportunidad, Funnel, Contacto1, Contacto2, Correo_Electronico1, Correo_Electronico2, Telefono, Puesto, Fecha_Contacto_Inicial, Fecha_Ultimo_Contacto, Evento_Ultimo_Contacto, Dias_en_Pipeline, Responsable_Seguimiento, Status, Producto_a_Transportar, Tipo_Cliente_Actividad, Nombre_Intermediario, Segmento_Secundario, Proveedor_Actual, Ubicacion_Negociacion, Proyecto_Cross_Selling, IMPO, EXPO, NAC, DED, INTMDL, Mudanza, SPOT, CIRCUITO, PUERTOS, Origen, Destino, Bitacora_Seguimiento, Usuario_Creacion) "
+            "VALUES (:No, :Semana, :Fuente_Prospecto, :Cliente, :Bloque_Prospeccion, :Tipo_Cliente, :Zona_Geografica, :Segmento, :Clasificacion_Oportunidad, :Funnel, :Contacto1, :Contacto2, :Correo_Electronico1, :Correo_Electronico2, :Telefono, :Puesto, :Fecha_Contacto_Inicial, :Fecha_Ultimo_Contacto, :Evento_Ultimo_Contacto, :Dias_en_Pipeline, :Responsable_Seguimiento, :Status, :Producto_a_Transportar, :Tipo_Cliente_Actividad, :Nombre_Intermediario, :Segmento_Secundario, :Proveedor_Actual, :Ubicacion_Negociacion, :Proyecto_Cross_Selling, :IMPO, :EXPO, :NAC, :DED, :INTMDL, :Mudanza, :SPOT, :CIRCUITO, :PUERTOS, :Origen, :Destino, :Bitacora_Seguimiento, :Usuario_Creacion)"
         )
 
-        total_inserted = 0
+        # Preparar todos los parámetros para BULK INSERT
+        all_params_list = []
         for idx, rec in enumerate(records, start=1):
             params = {
                 'No': None, 'Semana': None, 'Fuente_Prospecto': None, 'Cliente': None, 'Bloque_Prospeccion': None,
                 'Tipo_Cliente': None, 'Zona_Geografica': None, 'Segmento': None, 'Clasificacion_Oportunidad': None, 'Funnel': None,
-                'Contacto': None, 'Correo_Electronico': None, 'Telefono': None, 'Puesto': None, 'Fecha_Contacto_Inicial': None,
+                'Contacto1': None, 'Contacto2': None, 'Correo_Electronico1': None, 'Correo_Electronico2': None, 'Telefono': None, 'Puesto': None, 'Fecha_Contacto_Inicial': None,
                 'Fecha_Ultimo_Contacto': None, 'Evento_Ultimo_Contacto': None, 'Dias_en_Pipeline': None, 'Responsable_Seguimiento': None,
                 'Status': None, 'Producto_a_Transportar': None, 'Tipo_Cliente_Actividad': None, 'Nombre_Intermediario': None,
                 'Segmento_Secundario': None, 'Proveedor_Actual': None, 'Ubicacion_Negociacion': None, 'Proyecto_Cross_Selling': None,
@@ -1414,10 +1600,14 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
                         params['Clasificacion_Oportunidad'] = val
                     elif norm_key == nk('FUNNEL'):
                         params['Funnel'] = val
-                    elif norm_key == nk('Contacto'):
-                        params['Contacto'] = val
-                    elif norm_key == nk('Correo Electronico'):
-                        params['Correo_Electronico'] = val
+                    elif norm_key == nk('Contacto 1'):
+                        params['Contacto1'] = val
+                    elif norm_key == nk('Contacto 2'):
+                        params['Contacto2'] = val
+                    elif norm_key == nk('Correo Electronico 1'):
+                        params['Correo_Electronico1'] = val
+                    elif norm_key == nk('Correo Electronico2'):
+                        params['Correo_Electronico2'] = val
                     elif norm_key == nk('Telefono'):
                         params['Telefono'] = val
                     elif norm_key == nk('Puesto'):
@@ -1502,15 +1692,10 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
             except Exception as log_ex:
                 logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
 
-            db.execute(text(insert_sql), params)
-            try:
-                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-            except Exception:
-                affected = None
-            try:
-                total_inserted += int(affected) if affected is not None else 0
-            except Exception:
-                pass
+            all_params_list.append(params)
+        
+        # Ejecutar BULK INSERT optimizado
+        total_inserted = _bulk_insert_with_fallback(db, insert_sql, all_params_list, "pipeline_comercial_tmp")
 
         # After inserts, call sp_proc_ontime if provided
         if username and original_name:
@@ -1665,7 +1850,8 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
             "VALUES (:Fecha, :Capacidad, :LT, :Origen, :Destino, :Ruta, :Disponibilidad, :Ejecutiva, :Cliente, :Ofertado_Desde, :Clasificacion_PQ_No_Cargo, :No_Cargo_Por, :Incidencias_Ejecutivas, :Usuario_Creacion)"
         )
 
-        total_inserted = 0
+        # Preparar todos los parámetros para BULK INSERT
+        all_params_list = []
         for idx, rec in enumerate(records, start=1):
             params = {
                 'Fecha': None, 'Capacidad': None, 'LT': None, 'Origen': None, 'Destino': None, 'Ruta': None,
@@ -1801,15 +1987,10 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
             except Exception as log_ex:
                 logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
 
-            db.execute(text(insert_sql), params)
-            try:
-                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-            except Exception:
-                affected = None
-            try:
-                total_inserted += int(affected) if affected is not None else 0
-            except Exception:
-                pass
+            all_params_list.append(params)
+        
+        # Ejecutar BULK INSERT optimizado
+        total_inserted = _bulk_insert_with_fallback(db, insert_sql, all_params_list, "disponibilidad_transporte_tmp")
 
         # After inserts, call sp_proc_ontime if username/original_name provided
         if username and original_name:
@@ -1956,7 +2137,8 @@ def process_factoraje(file_path: str, db: object, username: Optional[str] = None
             "VALUES (:Nombre, :No_Viaje, :No_Factura, :Flete, :Maniobras, :Otros, :Subtotal, :IVA, :ISR, :Total, :Fecha_Fact, :Cliente, :Usuario_Creacion)"
         )
 
-        total_inserted = 0
+        # Preparar todos los parámetros para BULK INSERT
+        all_params_list = []
         for idx, rec in enumerate(records, start=1):
             params = {
                 'Nombre': None, 'No_Viaje': None, 'No_Factura': None, 'Flete': None, 'Maniobras': None, 'Otros': None,
@@ -2069,15 +2251,10 @@ def process_factoraje(file_path: str, db: object, username: Optional[str] = None
             except Exception as log_ex:
                 logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
 
-            db.execute(text(insert_sql), params)
-            try:
-                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-            except Exception:
-                affected = None
-            try:
-                total_inserted += int(affected) if affected is not None else 0
-            except Exception:
-                pass
+            all_params_list.append(params)
+        
+        # Ejecutar BULK INSERT optimizado
+        total_inserted = _bulk_insert_with_fallback(db, insert_sql, all_params_list, "factoraje_tmp")
 
         # After inserts, call post-processing SP if provided
         if username and original_name:
@@ -2122,8 +2299,8 @@ def process_relacion_pago(file_path: str, db: object, username: Optional[str] = 
     try:
         # Read first sheet with header=0
         try:
-            df = pd.read_excel(file_path, sheet_name=0, header=0)
-            logging.getLogger('operations').info("Reading relacion_pago first sheet with header=0")
+            df = pd.read_excel(file_path, sheet_name=0, header=1)
+            logging.getLogger('operations').info("Reading relacion_pago first sheet with header=1")
         except Exception as read_err:
             logging.getLogger('operations').error(f"No se pudo leer la primera hoja: {read_err}")
             raise
@@ -2148,9 +2325,6 @@ def process_relacion_pago(file_path: str, db: object, username: Optional[str] = 
         records = df.to_dict(orient='records')
         processed_count = len(records)
 
-        # expected headers (human readable) - normalized comparison
-        expected = ['Nombre', 'No Viaje', 'No Factura', 'Flete', 'Maniobras', 'Otros', 'Subtotal', 'IVA', 'ISR', 'Total', 'FECHA FACT', 'CLIENTE']
-
         def nk_local(s: str) -> str:
             if s is None:
                 return ''
@@ -2159,100 +2333,130 @@ def process_relacion_pago(file_path: str, db: object, username: Optional[str] = 
             ss = ''.join(c for c in ss if not unicodedata.combining(c))
             return re.sub(r"\s+", " ", ss).strip().upper()
 
-        normalized_key_map = {nk_local(k): k for k in list(df.columns)}
-        normalized_expected = {nk_local(e): e for e in expected}
+        # Log columnas leídas por pandas (con sufijos automáticos para duplicados)
+        logging.getLogger('operations').info(f"Columnas detectadas en relacion_pago: {list(df.columns)}")
 
+        # Mapeo por posición de columna (0-based) según el orden esperado del Excel:
+        # Nombre, No Viaje, No Factura, Flete, Maniobras, Otros, Subtotal, IVA, Subtotal, ISR, IVA, SUBTOTAL, TOTAL, FECHA FACT, CLIENTE
+        # Pandas renombra duplicados: Subtotal, IVA, Subtotal.1, ISR, IVA.1, SUBTOTAL.2, TOTAL
+        column_mapping = {}
+        cols = list(df.columns)
+        
+        # Normalizar nombres de columnas para búsqueda
+        normalized_cols = {nk_local(k): k for k in cols}
+        
+        # Buscar FECHA_FACT y CLIENTE por nombre normalizado
+        fecha_fact_col = None
+        cliente_col = None
+        
+        for norm_key, orig_col in normalized_cols.items():
+            if 'FECHA' in norm_key and 'FACT' in norm_key:
+                fecha_fact_col = orig_col
+                logging.getLogger('operations').info(f"Encontrada columna FECHA_FACT: '{orig_col}'")
+            elif norm_key == 'CLIENTE':
+                cliente_col = orig_col
+                logging.getLogger('operations').info(f"Encontrada columna CLIENTE: '{orig_col}'")
+        
+        # Construir mapeo: primeras 13 columnas por posición, FECHA_FACT y CLIENTE por búsqueda
+        if len(cols) >= 13:
+            column_mapping = {
+                'Nombre': cols[0],           # Nombre
+                'No_Viaje': cols[1],         # No Viaje
+                'No_Factura': cols[2],       # No Factura
+                'Flete': cols[3],            # Flete
+                'Maniobras': cols[4],        # Maniobras
+                'Otros': cols[5],            # Otros
+                'Subtotal': cols[6],         # Subtotal (1ra)
+                'IVA': cols[7],              # IVA (1ra)
+                'Subtotal_IVA': cols[8],     # Subtotal (2da) → Subtotal_IVA
+                'ISR': cols[9],              # ISR
+                'IVA_ISR': cols[10],         # IVA (2da) → IVA_ISR
+                'Subtotal_ISR': cols[11],    # SUBTOTAL (3ra) → Subtotal_ISR
+                'Total': cols[12]            # TOTAL (índice 12)
+            }
+            
+            # Agregar FECHA_FACT y CLIENTE si se encontraron
+            if fecha_fact_col:
+                column_mapping['Fecha_Fact'] = fecha_fact_col
+            if cliente_col:
+                column_mapping['Cliente'] = cliente_col
+                
+            logging.getLogger('operations').info(f"Mapeo completado: {len(column_mapping)} columnas mapeadas")
+        else:
+            logging.getLogger('operations').error(f"Número de columnas insuficiente: {len(cols)}, se esperan al menos 13 columnas")
+            raise ValueError(f"El archivo debe tener al menos 13 columnas, pero tiene {len(cols)}")
+            
         insert_sql = (
-            "INSERT INTO dbo.relacion_pago_tmp (Nombre, No_Viaje, No_Factura, Flete, Maniobras, Otros, Subtotal, IVA, ISR, Total, Fecha_Fact, Cliente, Usuario_Creacion) "
-            "VALUES (:Nombre, :No_Viaje, :No_Factura, :Flete, :Maniobras, :Otros, :Subtotal, :IVA, :ISR, :Total, :Fecha_Fact, :Cliente, :Usuario_Creacion)"
+            "INSERT INTO dbo.relacion_pago_tmp (Nombre, No_Viaje, No_Factura, Flete, Maniobras, Otros, Subtotal, IVA, Subtotal_IVA, ISR, IVA_ISR, Subtotal_ISR, Total, Fecha_Fact, Cliente, Usuario_Creacion) "
+            "VALUES (:Nombre, :No_Viaje, :No_Factura, :Flete, :Maniobras, :Otros, :Subtotal, :IVA, :Subtotal_IVA, :ISR, :IVA_ISR, :Subtotal_ISR, :Total, :Fecha_Fact, :Cliente, :Usuario_Creacion)"
         )
 
-        total_inserted = 0
+        # Preparar todos los parámetros para BULK INSERT
+        all_params_list = []
         for idx, rec in enumerate(records, start=1):
             params = {
                 'Nombre': None, 'No_Viaje': None, 'No_Factura': None, 'Flete': None, 'Maniobras': None, 'Otros': None,
-                'Subtotal': None, 'IVA': None, 'ISR': None, 'Total': None, 'Fecha_Fact': None, 'Cliente': None, 'Usuario_Creacion': username
+                'Subtotal': None, 'IVA': None, 'Subtotal_IVA': None, 'ISR': None, 'IVA_ISR': None, 'Subtotal_ISR': None,
+                'Total': None, 'Fecha_Fact': None, 'Cliente': None, 'Usuario_Creacion': username
             }
 
-            for norm_key, col in normalized_key_map.items():
-                if norm_key in normalized_expected:
-                    val = rec.get(col)
-                    # Normalize strings
-                    if isinstance(val, str):
-                        val = val.replace('\xa0', ' ').strip()
-                        if val == '':
-                            val = None
+            # Mapear columnas usando el mapeo por posición
+            for param_name, excel_col in column_mapping.items():
+                val = rec.get(excel_col)
+                
+                # Normalize strings
+                if isinstance(val, str):
+                    val = val.replace('\xa0', ' ').strip()
+                    if val == '':
+                        val = None
 
-                    # Dates
-                    if val is not None and norm_key == nk_local('FECHA FACT'):
-                        try:
-                            if hasattr(val, 'to_pydatetime'):
-                                val = val.to_pydatetime()
-                            elif isinstance(val, _dt):
-                                pass
+                # Dates (solo para Fecha_Fact)
+                if val is not None and param_name == 'Fecha_Fact':
+                    try:
+                        if hasattr(val, 'to_pydatetime'):
+                            val = val.to_pydatetime()
+                        elif isinstance(val, _dt):
+                            pass
+                        else:
+                            parsed = pd.to_datetime(val, errors='coerce', dayfirst=False)
+                            if pd.isna(parsed):
+                                parsed = pd.to_datetime(val, errors='coerce', dayfirst=True)
+                            if not pd.isna(parsed):
+                                val = parsed.to_pydatetime()
                             else:
-                                parsed = pd.to_datetime(val, errors='coerce', dayfirst=False)
-                                if pd.isna(parsed):
-                                    parsed = pd.to_datetime(val, errors='coerce', dayfirst=True)
-                                if not pd.isna(parsed):
-                                    val = parsed.to_pydatetime()
+                                val = None
+                    except Exception:
+                        val = None
+
+                # Numeric coercion for monetary fields
+                if val is not None and param_name in {'Flete', 'Maniobras', 'Otros', 'Subtotal', 'IVA', 'Subtotal_IVA', 'ISR', 'IVA_ISR', 'Subtotal_ISR', 'Total'}:
+                    try:
+                        s = re.sub(r"[^0-9.,\-]", "", str(val))
+                        if s == '':
+                            val = None
+                        else:
+                            if s.count(',') > 0 and s.count('.') == 0:
+                                s = s.replace(',', '.')
+                            elif s.count(',') > 0 and s.count('.') > 0:
+                                if s.rfind('.') > s.rfind(','):
+                                    s = s.replace(',', '')
                                 else:
-                                    val = None
+                                    s = s.replace('.', '').replace(',', '.')
+                            d = Decimal(s)
+                            val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                    except Exception:
+                        try:
+                            val = float(str(val).replace(',', '.'))
                         except Exception:
                             val = None
 
-                    # Numeric coercion for monetary fields
-                    if val is not None and norm_key in {nk_local('Flete'), nk_local('Maniobras'), nk_local('Otros'), nk_local('Subtotal'), nk_local('IVA'), nk_local('ISR'), nk_local('Total')}:
-                        try:
-                            s = re.sub(r"[^0-9.,\-]", "", str(val))
-                            if s == '':
-                                val = None
-                            else:
-                                if s.count(',') > 0 and s.count('.') == 0:
-                                    s = s.replace(',', '.')
-                                elif s.count(',') > 0 and s.count('.') > 0:
-                                    if s.rfind('.') > s.rfind(','):
-                                        s = s.replace(',', '')
-                                    else:
-                                        s = s.replace('.', '').replace(',', '.')
-                                d = Decimal(s)
-                                val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                        except Exception:
-                            try:
-                                val = float(str(val).replace(',', '.'))
-                            except Exception:
-                                val = None
-
-                    # Assign to params by normalized expected key
-                    if norm_key == nk_local('NOMBRE'):
-                        params['Nombre'] = val
-                    elif norm_key == nk_local('NO VIAJE'):
-                        params['No_Viaje'] = val
-                    elif norm_key == nk_local('NO FACTURA'):
-                        params['No_Factura'] = val
-                    elif norm_key == nk_local('FLETE'):
-                        params['Flete'] = val
-                    elif norm_key == nk_local('MANIOBRAS'):
-                        params['Maniobras'] = val
-                    elif norm_key == nk_local('OTROS'):
-                        params['Otros'] = val
-                    elif norm_key == nk_local('SUBTOTAL'):
-                        params['Subtotal'] = val
-                    elif norm_key == nk_local('IVA'):
-                        params['IVA'] = val
-                    elif norm_key == nk_local('ISR'):
-                        params['ISR'] = val
-                    elif norm_key == nk_local('TOTAL'):
-                        params['Total'] = val
-                    elif norm_key == nk_local('FECHA FACT'):
-                        params['Fecha_Fact'] = val
-                    elif norm_key == nk_local('CLIENTE'):
-                        params['Cliente'] = val
+                # Asignar al parámetro correspondiente
+                params[param_name] = val
 
             # Safety: convert ints to strings for textual columns where appropriate
             for k in list(params.keys()):
                 v = params[k]
-                if isinstance(v, int) and k not in ('Flete', 'Maniobras', 'Otros', 'Subtotal', 'IVA', 'ISR', 'Total'):
+                if isinstance(v, int) and k not in ('Flete', 'Maniobras', 'Otros', 'Subtotal', 'IVA', 'Subtotal_IVA', 'ISR', 'IVA_ISR', 'Subtotal_ISR', 'Total'):
                     try:
                         params[k] = str(v)
                     except Exception:
@@ -2280,15 +2484,20 @@ def process_relacion_pago(file_path: str, db: object, username: Optional[str] = 
             except Exception as log_ex:
                 logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
 
-            db.execute(text(insert_sql), params)
-            try:
-                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-            except Exception:
-                affected = None
-            try:
-                total_inserted += int(affected) if affected is not None else 0
-            except Exception:
-                pass
+            all_params_list.append(params)
+        
+        # Limpiar tabla temporal antes de insertar
+        logging.getLogger('operations').info("Limpiando tabla relacion_pago_tmp antes de insertar...")
+        try:
+            db.execute(text("DELETE FROM dbo.relacion_pago_tmp"))
+            db.commit()
+            logging.getLogger('operations').info("Tabla relacion_pago_tmp limpiada exitosamente")
+        except Exception as delete_ex:
+            logging.getLogger('operations').error(f"Error limpiando tabla relacion_pago_tmp: {delete_ex}")
+            raise
+        
+        # Ejecutar BULK INSERT optimizado
+        total_inserted = _bulk_insert_with_fallback(db, insert_sql, all_params_list, "relacion_pago_tmp")
 
         # After inserts, call post-processing SP if provided
         if total_inserted > 0:
@@ -2296,14 +2505,102 @@ def process_relacion_pago(file_path: str, db: object, username: Optional[str] = 
                 processed_name = original_name
                 if processed_name.lower().startswith('temp_'):
                     processed_name = processed_name[5:]
-                sp2_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado,2"
+                
                 logging.getLogger('operations').info(f"Ejecutando Procedure para Relacion Pago usuario={username}, archivo={processed_name}")
-                db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
+                
                 try:
-                    sp2_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-                except Exception:
-                    sp2_af = None
-                logging.getLogger('operations').info(f"Procedure (Relacion Pago) @@ROWCOUNT={sp2_af}")
+                    # Hacer commit antes de ejecutar el SP para cerrar la transacción actual
+                    db.commit()
+                    logging.getLogger('operations').info("Commit realizado antes de ejecutar SP")
+                    
+                    # Obtener la conexión raw de pyodbc
+                    raw_conn = db.connection().connection
+                    cursor = raw_conn.cursor()
+                    
+                    # Ejecutar el SP
+                    cursor.execute(
+                        "EXEC dbo.sp_proc_ontime ?, ?, 2",
+                        (username, processed_name)
+                    )
+                    
+                    # Iterar por todos los resultsets
+                    error_msg = None
+                    error_severity = 0
+                    error_state = 0
+                    resultset_count = 0
+                    
+                    try:
+                        while True:
+                            resultset_count += 1
+                            logging.getLogger('operations').info(f"Procesando resultset #{resultset_count}")
+                            
+                            try:
+                                rows = cursor.fetchall()
+                                if rows and len(rows) > 0:
+                                    logging.getLogger('operations').info(f"Resultset #{resultset_count} tiene {len(rows)} fila(s)")
+                                    last_row = rows[-1]
+                                    
+                                    if cursor.description:
+                                        col_names = [col[0].lower() for col in cursor.description]
+                                        logging.getLogger('operations').info(f"Columnas: {col_names}")
+                                        
+                                        error_msg_idx = next((i for i, name in enumerate(col_names) if 'error_msg' in name.lower()), None)
+                                        error_severity_idx = next((i for i, name in enumerate(col_names) if 'error_severity' in name.lower()), None)
+                                        error_state_idx = next((i for i, name in enumerate(col_names) if 'error_state' in name.lower()), None)
+                                        
+                                        if error_msg_idx is not None:
+                                            error_msg = last_row[error_msg_idx] if error_msg_idx is not None else None
+                                            error_severity = last_row[error_severity_idx] if error_severity_idx is not None else 0
+                                            error_state = last_row[error_state_idx] if error_state_idx is not None else 0
+                                            logging.getLogger('operations').info(f"error_msg: '{error_msg}', error_severity: {error_severity}, error_state: {error_state}")
+                                else:
+                                    logging.getLogger('operations').info(f"Resultset #{resultset_count} vacío")
+                            except Exception as fetch_ex:
+                                logging.getLogger('operations').info(f"No se pudieron obtener filas: {fetch_ex}")
+                            
+                            # Avanzar al siguiente resultset
+                            try:
+                                if not cursor.nextset():
+                                    logging.getLogger('operations').info(f"No hay más resultsets. Total: {resultset_count}")
+                                    break
+                            except Exception as nextset_ex:
+                                # nextset() puede lanzar error si hay problemas de transacción
+                                logging.getLogger('operations').info(f"Error en nextset (fin de resultsets): {nextset_ex}")
+                                break
+                        
+                        # Verificar si hubo error
+                        if error_state and error_state > 0 and error_msg and str(error_msg).strip():
+                            logging.getLogger('operations').error(f"=" * 80)
+                            logging.getLogger('operations').error(f"ERROR EN STORED PROCEDURE sp_proc_ontime")
+                            logging.getLogger('operations').error(f"Usuario: {username}, Archivo: {processed_name}")
+                            logging.getLogger('operations').error(f"Error State: {error_state}")
+                            logging.getLogger('operations').error(f"Error Severity: {error_severity}")
+                            logging.getLogger('operations').error(f"Error Message: {error_msg}")
+                            logging.getLogger('operations').error(f"=" * 80)
+                            raise Exception(f"Error en sp_proc_ontime: {error_msg} (State: {error_state}, Severity: {error_severity})")
+                        else:
+                            logging.getLogger('operations').info(f"Procedure (Relacion Pago) ejecutado exitosamente")
+                            
+                    finally:
+                        try:
+                            cursor.close()
+                        except Exception:
+                            pass
+                        
+                except Exception as sp_ex:
+                    error_msg = str(sp_ex)
+                    
+                    # Si es un error que ya procesamos, re-lanzar
+                    if "Error en sp_proc_ontime:" in error_msg and "State:" in error_msg:
+                        raise
+                    
+                    # Error SQL inesperado
+                    logging.getLogger('operations').error(f"=" * 80)
+                    logging.getLogger('operations').error(f"ERROR EJECUTANDO STORED PROCEDURE")
+                    logging.getLogger('operations').error(f"Usuario: {username}, Archivo: {processed_name}")
+                    logging.getLogger('operations').error(f"Error: {error_msg}")
+                    logging.getLogger('operations').error(f"=" * 80)
+                    raise Exception(f"Error ejecutando sp_proc_ontime: {error_msg}")
 
         logging.getLogger('operations').info(f"Relacion Pago: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
         return processed_count
@@ -2393,7 +2690,8 @@ def process_venta_perdida(file_path: str, db: object, username: Optional[str] = 
             "VALUES (:Fecha_De_Oferta, :No_De_Carga, :Origen, :Destino, :Ruta, :Fecha_De_Carga, :Ejecutivo, :Cliente, :Capacidad, :Total_Vta_Perdida, :Sin_Programa_Carga, :Usuario_Creacion)"
         )
 
-        total_inserted = 0
+        # Preparar todos los parámetros para BULK INSERT
+        all_params_list = []
         for idx, rec in enumerate(records, start=1):
             params = {
                 'Fecha_De_Oferta': None, 'No_De_Carga': None, 'Origen': None, 'Destino': None, 'Ruta': None,
@@ -2545,15 +2843,10 @@ def process_venta_perdida(file_path: str, db: object, username: Optional[str] = 
             except Exception:
                 pass
 
-            db.execute(text(insert_sql), params)
-            try:
-                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-            except Exception:
-                affected = None
-            try:
-                total_inserted += int(affected) if affected is not None else 0
-            except Exception:
-                pass
+            all_params_list.append(params)
+        
+        # Ejecutar BULK INSERT optimizado
+        total_inserted = _bulk_insert_with_fallback(db, insert_sql, all_params_list, "venta_perdida_tmp")
 
         # call sp_proc_ontime if provided
         if username and original_name:
@@ -2731,6 +3024,7 @@ def process_evidencias_pendientes(file_path: str, db: object, username: Optional
             "VALUES (:Cliente, :Mes1, :Total_Mes1, :Mes2, :Total_Mes2, :Mes3, :Total_Mes3, :Mes4, :Total_Mes4, :Total_General, :Usuario_Creacion)"
         )
 
+        all_params_list = []
         total_inserted = 0
         # detect if there is an explicit "Total general" column in the sheet
         total_general_col = None
@@ -2868,15 +3162,10 @@ def process_evidencias_pendientes(file_path: str, db: object, username: Optional
             except Exception:
                 pass
 
-            db.execute(text(insert_sql), params)
-            try:
-                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-            except Exception:
-                affected = None
-            try:
-                total_inserted += int(affected) if affected is not None else 0
-            except Exception:
-                pass
+            all_params_list.append(params)
+
+        # After loop, perform BULK INSERT
+        total_inserted = _bulk_insert_with_fallback(db, insert_sql, all_params_list, "evidencias_pendientes_tmp")
 
         # After inserts, call post-processing SP if provided
         if username and original_name:
@@ -3061,6 +3350,7 @@ def process_pronostico_cobranza(file_path: str, db: object, username: Optional[s
             "VALUES (:Cliente, :Semana1, :Total_Semana1, :Semana2, :Total_Semana2, :Semana3, :Total_Semana3, :Semana4, :Total_Semana4, :Semana5, :Total_Semana5, :Semana6, :Total_Semana6, :Semana7, :Total_Semana7, :Semana8, :Total_Semana8, :Semana9, :Total_Semana9, :Semana10, :Total_Semana10, :Semana11, :Total_Semana11, :Semana12, :Total_Semana12, :Semana13, :Total_Semana13, :Total_General, :Usuario_Creacion, :Fecha_Creacion)"
         )
 
+        all_params_list = []
         total_inserted = 0
 
         for idx, rec in enumerate(records, start=1):
@@ -3199,15 +3489,10 @@ def process_pronostico_cobranza(file_path: str, db: object, username: Optional[s
             except Exception:
                 pass
 
-            db.execute(text(insert_sql), params)
-            try:
-                affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-            except Exception:
-                affected = None
-            try:
-                total_inserted += int(affected) if affected is not None else 0
-            except Exception:
-                pass
+            all_params_list.append(params)
+
+        # After loop, perform BULK INSERT
+        total_inserted = _bulk_insert_with_fallback(db, insert_sql, all_params_list, "pronostico_cobranza_tmp")
 
         # After inserts, call post-processing SP if provided
         if username and original_name:

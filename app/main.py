@@ -1422,3 +1422,202 @@ def revoke_token(token_id: int, db: Session = Depends(get_db), current_user: mod
     db.commit()
     db.refresh(token)
     return {"id": token.id, "activo": token.activo}
+
+
+# --- Endpoint para sincronización de datos ---
+@app.post("/sincronizacion-data")
+async def sincronizacion_data(db: Session = Depends(get_db), current_user: models.Usuario = Depends(get_current_user)):
+    """
+    Endpoint que se autentica con la API externa en localhost:5000 y obtiene datos de clientes.
+    
+    Proceso:
+    1. Llama a /login para obtener el token
+    2. Usa el token para llamar a /clientes
+    3. Inserta los clientes en dbo.Clientes_tmp
+    4. Registra la respuesta en el log
+    """
+    import httpx
+    import json
+    
+    # Leer la URL base desde el archivo de propiedades
+    properties_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.properties')
+    BASE_URL = "http://localhost:5000"  # Valor por defecto
+    
+    try:
+        with open(properties_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    if key.strip() == 'api.external.base_url':
+                        BASE_URL = value.strip()
+                        break
+        ops_logger.info(f"URL base de API externa cargada desde config.properties: {BASE_URL}")
+    except Exception as e:
+        ops_logger.warning(f"No se pudo leer config.properties, usando valor por defecto: {e}")
+    
+    LOGIN_ENDPOINT = f"{BASE_URL}/login"
+    CLIENTES_ENDPOINT = f"{BASE_URL}/clientes"
+    
+    try:
+        logging.getLogger('operations').info(f"Iniciando sincronización de datos - Usuario: {current_user.nombre_usuario}")
+        
+        # Paso 1: Autenticación
+        login_payload = {
+            "username": "admin",
+            "password": "admin123"
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Login
+            ops_logger.info(f"Conectando login")
+            login_response = await client.post(LOGIN_ENDPOINT, json=login_payload)
+            
+            if login_response.status_code != 200:
+                ops_logger.error(f"Error en login: Status {login_response.status_code}, Response: {login_response.text}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Error al autenticar con API externa: {login_response.status_code}"
+                )
+            
+            login_data = login_response.json()
+            ops_logger.info(f"Login exitoso - Usuario: {login_data.get('usuario', {}).get('username')}, Token tipo: {login_data.get('tipo')}")
+            
+            # Extraer el token
+            token = login_data.get("token")
+            if not token:
+                ops_logger.error("No se obtuvo token en la respuesta de login")
+                raise HTTPException(status_code=500, detail="No se obtuvo token de autenticación")
+            
+            # Paso 2: Llamar al endpoint de clientes con el token
+            headers = {
+                "Authorization": f"Bearer {token}"
+            }
+            
+            ops_logger.info(f"Conectando clientes")
+            clientes_response = await client.get(CLIENTES_ENDPOINT, headers=headers)
+            
+            if clientes_response.status_code != 200:
+                ops_logger.error(f"Error al obtener clientes: Status {clientes_response.status_code}, Response: {clientes_response.text}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Error al obtener datos de clientes: {clientes_response.status_code}"
+                )
+            
+            response_data = clientes_response.json()
+            
+            # Registrar la respuesta en el log
+            ops_logger.info("=" * 80)
+            ops_logger.info("RESPUESTA OBTENIDA:")
+            ops_logger.info("=" * 80)
+            #ops_logger.info(f"Respuesta completa: {json.dumps(response_data, indent=2, ensure_ascii=False)}")
+            ops_logger.info("=" * 80)
+            
+            # Extraer el array de clientes del objeto de respuesta
+            clientes_data = response_data.get('clientes', [])
+            
+        # Paso 3: Insertar clientes en dbo.Clientes_tmp
+        ops_logger.info(f"Iniciando inserción de clientes - Total: {len(clientes_data)}")
+        
+        if not isinstance(clientes_data, list):
+            ops_logger.error("Los datos de clientes no son una lista")
+            raise HTTPException(status_code=500, detail="Formato de datos de clientes inválido")
+        
+        try:
+            # Primero, obtener los nombres de columnas reales de la tabla
+            #ops_logger.info("Consultando estructura de tabla dbo.Clientes_tmp")
+            columns_result = db.execute(text("""
+                SELECT COLUMN_NAME 
+                FROM INFORMATION_SCHEMA.COLUMNS 
+                WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'Clientes_tmp'
+                ORDER BY ORDINAL_POSITION
+            """))
+            column_names = [row[0] for row in columns_result]
+            #ops_logger.info(f"Columnas encontradas en dbo.Clientes_tmp: {column_names}")
+            
+            # Limpiar la tabla temporal antes de insertar
+            #ops_logger.info("Limpiando tabla dbo.Clientes_tmp")
+            db.execute(text("TRUNCATE TABLE dbo.Clientes_tmp"))
+            
+            # Construir el SQL de inserción dinámicamente basado en las columnas reales
+            if len(column_names) >= 2:
+                col1, col2 = column_names[0], column_names[1]
+                insert_sql = text(f"INSERT INTO dbo.Clientes_tmp ({col1}, {col2}) VALUES (:id, :razon_social)")
+                #ops_logger.info(f"SQL de inserción: INSERT INTO dbo.Clientes_tmp ({col1}, {col2}) VALUES (:id, :razon_social)")
+            else:
+                ops_logger.error(f"La tabla no tiene suficientes columnas: {column_names}")
+                raise HTTPException(status_code=500, detail="Estructura de tabla Clientes_tmp inválida")
+            
+            clientes_insertados = 0
+            
+            for cliente in clientes_data:
+                # Extraer ID y RazonSocial del cliente
+                cliente_id = cliente.get('id') or cliente.get('ID') or cliente.get('cliente_id')
+                razon_social = cliente.get('razon_social') or cliente.get('RazonSocial') or cliente.get('nombre') or cliente.get('Nombre')
+                
+                if cliente_id is None or razon_social is None:
+                    ops_logger.warning(f"Cliente sin ID o RazonSocial, saltando: {cliente}")
+                    continue
+                
+                # Insertar el cliente
+                db.execute(insert_sql, {"id": cliente_id, "razon_social": razon_social})
+                clientes_insertados += 1
+            
+            # Commit de todas las inserciones
+            db.commit()
+            
+            ops_logger.info(f"Inserción completada: {clientes_insertados} clientes insertados")
+            
+            # Ejecutar el stored procedure de sincronización
+            #ops_logger.info("Ejecutando stored procedure dbo.sp_sincroniza_data")
+            try:
+                db.execute(text("EXEC dbo.sp_sincroniza_data"))
+                db.commit()
+                ops_logger.info("Stored procedure ejecutado exitosamente")
+            except Exception as sp_err:
+                ops_logger.error(f"Error ejecutando stored procedure : {str(sp_err)}")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Error ejecutando stored procedure: {str(sp_err)}"
+                )
+            
+            ops_logger.info("Sincronización completada exitosamente")
+            
+            return {
+                "success": True,
+                "mensaje": "Sincronización completada exitosamente",
+                "total_clientes": len(clientes_data),
+                "clientes_insertados": clientes_insertados,
+                "stored_procedure_ejecutado": True,
+                "datos_registrados_en_log": True
+            }
+            
+        except Exception as db_err:
+            ops_logger.error(f"Error al insertar clientes en base de datos: {str(db_err)}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error al insertar clientes en base de datos: {str(db_err)}"
+            )
+            
+    except httpx.RequestError as e:
+        ops_logger.error(f"Error de conexión con API externa: {str(e)}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"No se pudo conectar con la API externa: {str(e)}"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        ops_logger.error(f"Error inesperado en sincronización: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error en sincronización: {str(e)}"
+        )
