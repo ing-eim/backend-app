@@ -1415,8 +1415,8 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
         # Expected headers (human names) - used by the header-detection heuristic
         expected = [
             'No', 'Semana', 'Fuente de Prospecto', 'Cliente', 'Bloque de prospección', 'Tipo de cliente', 'ZONA GEOGRAFICA',
-            'Segmento', 'Clasificación de la oportunidad %', 'FUNNEL', 'Contacto 1','Contacto 2', 'Correo Electronico 1','Correo Electronico2', 'Telefono', 'Puesto',
-            'Fecha Contacto Inicial', 'Fecha Ultimo contacto', 'Evento Ultimo Contacto', 'Dias en Pipeline', 'Responsable de Seguimiento',
+            'Segmento', 'Clasificación de la oportunidad %', 'FUNNEL', 'Contacto 1','Contacto 2', 'Correo Electronico 1','Correo Electronico2', 'Telefono1', 'Telefono2', 'Puesto',
+            'Fecha Contacto Inicial', 'FechaUltimocontacto', 'Evento Ultimo Contacto', 'Dias en Pipeline', 'Responsable de Seguimiento',
             'Status', 'Producto a Transportar', 'Tipo de cliente (por su actividad)', 'Nombre de intermediario', 'Segmento',
             'Proveedor Actual', 'Ubicación de Negociación', 'Proyecto Cross Selling / Quien Genero la oportunidad',
             'IMPO', 'EXPO', 'NAC', 'DED', 'INTMDL', 'Mudanza', 'SPOT', 'CIRCUITO', 'PUERTOS', 'Origen', 'Destino', 'Bitacora de seguimiento'
@@ -1445,15 +1445,15 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
             raise
 
         # If the first physical column is empty/placeholder, drop it so logical columns start at physical col 2
-        try:
-            if df.shape[1] >= 2:
+    #    try:
+    #        if df.shape[1] >= 2:
                 # Drop the first physical column because it's always empty per file convention.
-                df = df.iloc[:, 1:].copy()
-                logging.getLogger('operations').info(f"Dropped first physical column; columns now: {list(df.columns)}")
-            else:
-                logging.getLogger('operations').warning(f"Sheet {sheet_to_use} tiene menos de 2 columnas; no se eliminó la primera columna")
-        except Exception as drop_err:
-            logging.getLogger('operations').warning(f"No se pudo eliminar la primera columna física: {drop_err}")
+    #            df = df.iloc[:, 1:].copy()
+    #            logging.getLogger('operations').info(f"Dropped first physical column; columns now: {list(df.columns)}")
+    #        else:
+    #            logging.getLogger('operations').warning(f"Sheet {sheet_to_use} tiene menos de 2 columnas; no se eliminó la primera columna")
+    #    except Exception as drop_err:
+    #        logging.getLogger('operations').warning(f"No se pudo eliminar la primera columna física: {drop_err}")
 
         df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
         df = df.where(pd.notnull(df), None)
@@ -1481,8 +1481,8 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
         
 
         insert_sql = (
-            "INSERT INTO dbo.pipeline_comercial_tmp (No, Semana, Fuente_Prospecto, Cliente, Bloque_Prospeccion, Tipo_Cliente, Zona_Geografica, Segmento, Clasificacion_Oportunidad, Funnel, Contacto1, Contacto2, Correo_Electronico1, Correo_Electronico2, Telefono, Puesto, Fecha_Contacto_Inicial, Fecha_Ultimo_Contacto, Evento_Ultimo_Contacto, Dias_en_Pipeline, Responsable_Seguimiento, Status, Producto_a_Transportar, Tipo_Cliente_Actividad, Nombre_Intermediario, Segmento_Secundario, Proveedor_Actual, Ubicacion_Negociacion, Proyecto_Cross_Selling, IMPO, EXPO, NAC, DED, INTMDL, Mudanza, SPOT, CIRCUITO, PUERTOS, Origen, Destino, Bitacora_Seguimiento, Usuario_Creacion) "
-            "VALUES (:No, :Semana, :Fuente_Prospecto, :Cliente, :Bloque_Prospeccion, :Tipo_Cliente, :Zona_Geografica, :Segmento, :Clasificacion_Oportunidad, :Funnel, :Contacto1, :Contacto2, :Correo_Electronico1, :Correo_Electronico2, :Telefono, :Puesto, :Fecha_Contacto_Inicial, :Fecha_Ultimo_Contacto, :Evento_Ultimo_Contacto, :Dias_en_Pipeline, :Responsable_Seguimiento, :Status, :Producto_a_Transportar, :Tipo_Cliente_Actividad, :Nombre_Intermediario, :Segmento_Secundario, :Proveedor_Actual, :Ubicacion_Negociacion, :Proyecto_Cross_Selling, :IMPO, :EXPO, :NAC, :DED, :INTMDL, :Mudanza, :SPOT, :CIRCUITO, :PUERTOS, :Origen, :Destino, :Bitacora_Seguimiento, :Usuario_Creacion)"
+            "INSERT INTO dbo.pipeline_comercial_tmp (No, Semana, Fuente_Prospecto, Cliente, Bloque_Prospeccion, Tipo_Cliente, Zona_Geografica, Segmento, Clasificacion_Oportunidad, Funnel, Contacto1, Contacto2, Correo_Electronico1, Correo_Electronico2, Telefono1, Telefono2, Puesto, Fecha_Contacto_Inicial, Fecha_Ultimo_Contacto, Evento_Ultimo_Contacto, Dias_en_Pipeline, Responsable_Seguimiento, Status, Producto_a_Transportar, Tipo_Cliente_Actividad, Nombre_Intermediario, Segmento_Secundario, Proveedor_Actual, Ubicacion_Negociacion, Proyecto_Cross_Selling, IMPO, EXPO, NAC, DED, INTMDL, Mudanza, SPOT, CIRCUITO, PUERTOS, Origen, Destino, Bitacora_Seguimiento, Usuario_Creacion) "
+            "VALUES (:No, :Semana, :Fuente_Prospecto, :Cliente, :Bloque_Prospeccion, :Tipo_Cliente, :Zona_Geografica, :Segmento, :Clasificacion_Oportunidad, :Funnel, :Contacto1, :Contacto2, :Correo_Electronico1, :Correo_Electronico2, :Telefono1, :Telefono2, :Puesto, :Fecha_Contacto_Inicial, :Fecha_Ultimo_Contacto, :Evento_Ultimo_Contacto, :Dias_en_Pipeline, :Responsable_Seguimiento, :Status, :Producto_a_Transportar, :Tipo_Cliente_Actividad, :Nombre_Intermediario, :Segmento_Secundario, :Proveedor_Actual, :Ubicacion_Negociacion, :Proyecto_Cross_Selling, :IMPO, :EXPO, :NAC, :DED, :INTMDL, :Mudanza, :SPOT, :CIRCUITO, :PUERTOS, :Origen, :Destino, :Bitacora_Seguimiento, :Usuario_Creacion)"
         )
 
         # Preparar todos los parámetros para BULK INSERT
@@ -1491,7 +1491,7 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
             params = {
                 'No': None, 'Semana': None, 'Fuente_Prospecto': None, 'Cliente': None, 'Bloque_Prospeccion': None,
                 'Tipo_Cliente': None, 'Zona_Geografica': None, 'Segmento': None, 'Clasificacion_Oportunidad': None, 'Funnel': None,
-                'Contacto1': None, 'Contacto2': None, 'Correo_Electronico1': None, 'Correo_Electronico2': None, 'Telefono': None, 'Puesto': None, 'Fecha_Contacto_Inicial': None,
+                'Contacto1': None, 'Contacto2': None, 'Correo_Electronico1': None, 'Correo_Electronico2': None, 'Telefono1': None, 'Telefono2': None, 'Puesto': None, 'Fecha_Contacto_Inicial': None,
                 'Fecha_Ultimo_Contacto': None, 'Evento_Ultimo_Contacto': None, 'Dias_en_Pipeline': None, 'Responsable_Seguimiento': None,
                 'Status': None, 'Producto_a_Transportar': None, 'Tipo_Cliente_Actividad': None, 'Nombre_Intermediario': None,
                 'Segmento_Secundario': None, 'Proveedor_Actual': None, 'Ubicacion_Negociacion': None, 'Proyecto_Cross_Selling': None,
@@ -1508,7 +1508,7 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
                             val = None
 
                     # Dates: try month-first then day-first
-                    if val is not None and norm_key in (nk('Fecha Contacto Inicial'), nk('Fecha Ultimo contacto')):
+                    if val is not None and norm_key in (nk('Fecha Contacto Inicial'), nk('FechaUltimocontacto')):
                         try:
                             if hasattr(val, 'to_pydatetime'):
                                 val = val.to_pydatetime()
@@ -1608,13 +1608,15 @@ def process_pipeline_comercial(file_path: str, db: object, username: Optional[st
                         params['Correo_Electronico1'] = val
                     elif norm_key == nk('Correo Electronico2'):
                         params['Correo_Electronico2'] = val
-                    elif norm_key == nk('Telefono'):
-                        params['Telefono'] = val
+                    elif norm_key == nk('Telefono1'):
+                        params['Telefono1'] = val
+                    elif norm_key == nk('Telefono2'):
+                        params['Telefono2'] = val
                     elif norm_key == nk('Puesto'):
                         params['Puesto'] = val
                     elif norm_key == nk('Fecha Contacto Inicial'):
                         params['Fecha_Contacto_Inicial'] = val
-                    elif norm_key == nk('Fecha Ultimo contacto'):
+                    elif norm_key == nk('FechaUltimocontacto'):
                         params['Fecha_Ultimo_Contacto'] = val
                     elif norm_key == nk('Evento Ultimo Contacto'):
                         params['Evento_Ultimo_Contacto'] = val
