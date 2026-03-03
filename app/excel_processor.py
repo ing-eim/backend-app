@@ -3519,3 +3519,461 @@ def process_pronostico_cobranza(file_path: str, db: object, username: Optional[s
         except Exception:
             pass
         raise
+
+
+def process_presupuesto(file_path: str, db: object, username: Optional[str] = None, original_name: Optional[str] = None) -> int:
+    """Process presupuesto files into dbo.presupuesto_tmp.
+
+    - Filename expected format: presupuesto_MM_AAAA (MM = month, AAAA = year) - validado por caller
+    - Reads the FIRST sheet of the workbook (sheet index 0)
+    - Headers are on row 3 (Excel), data starts on row 4 (pandas header=2)
+    - Omits rows whose first column is empty.
+    - Reads MES value directly from Excel (column 'MES') - e.g., ENERO, FEBRERO, etc.
+    - Inserts rows (no commit) into dbo.presupuesto_tmp following the exact column order.
+    - Calls dbo.sp_proc_ontime(:nombre_usuario, :name_file_procesado, 14) after successful inserts if username and original_name provided.
+
+    Returns number of rows inserted (omitting empty-first-column rows).
+    """
+    logging.getLogger('operations').info(f"Procesando presupuesto: {file_path}")
+    try:
+        logging.getLogger('operations').info(f"Procesando presupuesto: {file_path}")
+    except Exception:
+        pass
+    try:
+        # Read first sheet with header=2 (row 3 contains headers)
+        try:
+            df = pd.read_excel(file_path, sheet_name=0, header=2)
+            logging.getLogger('operations').info("Reading presupuesto first sheet with header=2 (headers on row 3)")
+        except Exception as read_err:
+            logging.getLogger('operations').error(f"No se pudo leer la primera hoja: {read_err}")
+            raise
+
+        df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
+        df = df.where(pd.notnull(df), None)
+
+        # Omit rows where first column is empty
+        if df.shape[1] > 0:
+            first_col = df.columns[0]
+            before_count = len(df)
+            try:
+                non_empty_mask = df[first_col].notnull() & (df[first_col].astype(str).str.strip() != '')
+            except Exception:
+                non_empty_mask = df[first_col].notnull()
+            df = df[non_empty_mask]
+            after_count = len(df)
+            dropped = before_count - after_count
+            if dropped > 0:
+                logging.getLogger('operations').info(f"Presupuesto: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
+
+        records = df.to_dict(orient='records')
+        processed_count = len(records)
+
+        def nk_local(s: str) -> str:
+            if s is None:
+                return ''
+            ss = str(s).replace('\xa0', ' ')
+            ss = unicodedata.normalize('NFKD', ss)
+            ss = ''.join(c for c in ss if not unicodedata.combining(c))
+            return re.sub(r"\s+", " ", ss).strip().upper()
+
+        # Log columnas leídas
+        logging.getLogger('operations').info(f"Columnas detectadas en presupuesto: {list(df.columns)}")
+
+        # Mapeo normalizado de columnas
+        normalized_cols = {nk_local(k): k for k in list(df.columns)}
+
+        insert_sql = (
+            "INSERT INTO dbo.presupuesto_tmp (MES, CATEGORIA_INGRESO, CLIENTE, SECTOR_INDUSTRIAL_CLIENTE, Ejecutiva, Ruta, Configuracion, Operacion, Tipo, Viajes_Prom_Vta_Confirmada, Viajes_Prom_Vta_Perdida, Viajes_Presupuestados, Tarifa_Venta, Venta_Mensual, Tarifa_Compra, Compra_Mensual, Utilidad, Porcentaje_Utilidad, Validacion, Proveedor, Usuario_Creacion) "
+            "VALUES (:MES, :CATEGORIA_INGRESO, :CLIENTE, :SECTOR_INDUSTRIAL_CLIENTE, :Ejecutiva, :Ruta, :Configuracion, :Operacion, :Tipo, :Viajes_Prom_Vta_Confirmada, :Viajes_Prom_Vta_Perdida, :Viajes_Presupuestados, :Tarifa_Venta, :Venta_Mensual, :Tarifa_Compra, :Compra_Mensual, :Utilidad, :Porcentaje_Utilidad, :Validacion, :Proveedor, :Usuario_Creacion)"
+        )
+
+        # Preparar todos los parámetros para BULK INSERT
+        all_params_list = []
+        for idx, rec in enumerate(records, start=1):
+            params = {
+                'MES': None,
+                'CATEGORIA_INGRESO': None,
+                'CLIENTE': None,
+                'SECTOR_INDUSTRIAL_CLIENTE': None,
+                'Ejecutiva': None,
+                'Ruta': None,
+                'Configuracion': None,
+                'Operacion': None,
+                'Tipo': None,
+                'Viajes_Prom_Vta_Confirmada': None,
+                'Viajes_Prom_Vta_Perdida': None,
+                'Viajes_Presupuestados': None,
+                'Tarifa_Venta': None,
+                'Venta_Mensual': None,
+                'Tarifa_Compra': None,
+                'Compra_Mensual': None,
+                'Utilidad': None,
+                'Porcentaje_Utilidad': None,
+                'Validacion': None,
+                'Proveedor': None,
+                'Usuario_Creacion': username
+            }
+
+            # Mapear columnas por búsqueda normalizada
+            for norm_key, excel_col in normalized_cols.items():
+                val = rec.get(excel_col)
+                
+                # Normalize strings
+                if isinstance(val, str):
+                    val = val.replace('\xa0', ' ').strip()
+                    if val == '':
+                        val = None
+
+                # Mapeo de columnas por coincidencia normalizada
+                if norm_key == 'MES':
+                    params['MES'] = val
+                elif ('SECTOR' in norm_key and 'INDUTRIAL' in norm_key) or 'SECTOR INDUTRIAL CLIENTE' in norm_key:
+                    params['SECTOR_INDUSTRIAL_CLIENTE'] = val
+                elif ('CATEGORIA' in norm_key and 'INGRESO' in norm_key) or norm_key == 'CATEGORIA INGRESO':
+                    params['CATEGORIA_INGRESO'] = val
+                elif norm_key == 'CLIENTE':
+                    params['CLIENTE'] = val
+                elif norm_key == 'EJECUTIVA' or norm_key == 'EJECUTIVO':
+                    params['Ejecutiva'] = val
+                elif norm_key == 'RUTA':
+                    params['Ruta'] = val
+                elif 'CONFIGURACION' in norm_key:
+                    params['Configuracion'] = val
+                elif 'OPERACION' in norm_key:
+                    params['Operacion'] = val
+                elif norm_key == 'TIPO':
+                    params['Tipo'] = val
+                elif 'VIAJES' in norm_key and 'CONFIRMADA' in norm_key:
+                    if val is not None:
+                        try:
+                            s = re.sub(r"[^0-9.,\-]", "", str(val))
+                            if s == '':
+                                val = None
+                            else:
+                                if s.count(',') > 0 and s.count('.') == 0:
+                                    s = s.replace(',', '.')
+                                elif s.count(',') > 0 and s.count('.') > 0:
+                                    if s.rfind('.') > s.rfind(','):
+                                        s = s.replace(',', '')
+                                    else:
+                                        s = s.replace('.', '').replace(',', '.')
+                                d = Decimal(s)
+                                val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            try:
+                                val = Decimal(str(float(str(val).replace(',', '.'))))
+                            except Exception:
+                                val = None
+                    params['Viajes_Prom_Vta_Confirmada'] = val
+                elif 'VIAJES' in norm_key and 'PERDIDA' in norm_key:
+                    if val is not None:
+                        try:
+                            s = re.sub(r"[^0-9.,\-]", "", str(val))
+                            if s == '':
+                                val = None
+                            else:
+                                if s.count(',') > 0 and s.count('.') == 0:
+                                    s = s.replace(',', '.')
+                                elif s.count(',') > 0 and s.count('.') > 0:
+                                    if s.rfind('.') > s.rfind(','):
+                                        s = s.replace(',', '')
+                                    else:
+                                        s = s.replace('.', '').replace(',', '.')
+                                d = Decimal(s)
+                                val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            try:
+                                val = Decimal(str(float(str(val).replace(',', '.'))))
+                            except Exception:
+                                val = None
+                    params['Viajes_Prom_Vta_Perdida'] = val
+                elif 'VIAJES' in norm_key and 'PRESUPUESTADOS' in norm_key:
+                    if val is not None:
+                        try:
+                            val = int(float(str(val).replace(',', '.')))
+                        except Exception:
+                            val = None
+                    params['Viajes_Presupuestados'] = val
+                elif 'TARIFA' in norm_key and 'VENTA' in norm_key:
+                    if val is not None:
+                        try:
+                            s = re.sub(r"[^0-9.,\-]", "", str(val))
+                            if s == '':
+                                val = None
+                            else:
+                                if s.count(',') > 0 and s.count('.') == 0:
+                                    s = s.replace(',', '.')
+                                elif s.count(',') > 0 and s.count('.') > 0:
+                                    if s.rfind('.') > s.rfind(','):
+                                        s = s.replace(',', '')
+                                    else:
+                                        s = s.replace('.', '').replace(',', '.')
+                                d = Decimal(s)
+                                val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            try:
+                                val = Decimal(str(float(str(val).replace(',', '.'))))
+                            except Exception:
+                                val = None
+                    params['Tarifa_Venta'] = val
+                elif 'VENTA' in norm_key and 'MENSUAL' in norm_key:
+                    if val is not None:
+                        try:
+                            s = re.sub(r"[^0-9.,\-]", "", str(val))
+                            if s == '':
+                                val = None
+                            else:
+                                if s.count(',') > 0 and s.count('.') == 0:
+                                    s = s.replace(',', '.')
+                                elif s.count(',') > 0 and s.count('.') > 0:
+                                    if s.rfind('.') > s.rfind(','):
+                                        s = s.replace(',', '')
+                                    else:
+                                        s = s.replace('.', '').replace(',', '.')
+                                d = Decimal(s)
+                                val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            try:
+                                val = Decimal(str(float(str(val).replace(',', '.'))))
+                            except Exception:
+                                val = None
+                    params['Venta_Mensual'] = val
+                elif 'TARIFA' in norm_key and 'COMPRA' in norm_key:
+                    if val is not None:
+                        try:
+                            s = re.sub(r"[^0-9.,\-]", "", str(val))
+                            if s == '':
+                                val = None
+                            else:
+                                if s.count(',') > 0 and s.count('.') == 0:
+                                    s = s.replace(',', '.')
+                                elif s.count(',') > 0 and s.count('.') > 0:
+                                    if s.rfind('.') > s.rfind(','):
+                                        s = s.replace(',', '')
+                                    else:
+                                        s = s.replace('.', '').replace(',', '.')
+                                d = Decimal(s)
+                                val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            try:
+                                val = Decimal(str(float(str(val).replace(',', '.'))))
+                            except Exception:
+                                val = None
+                    params['Tarifa_Compra'] = val
+                elif 'COMPRA' in norm_key and 'MENSUAL' in norm_key:
+                    if val is not None:
+                        try:
+                            s = re.sub(r"[^0-9.,\-]", "", str(val))
+                            if s == '':
+                                val = None
+                            else:
+                                if s.count(',') > 0 and s.count('.') == 0:
+                                    s = s.replace(',', '.')
+                                elif s.count(',') > 0 and s.count('.') > 0:
+                                    if s.rfind('.') > s.rfind(','):
+                                        s = s.replace(',', '')
+                                    else:
+                                        s = s.replace('.', '').replace(',', '.')
+                                d = Decimal(s)
+                                val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            try:
+                                val = Decimal(str(float(str(val).replace(',', '.'))))
+                            except Exception:
+                                val = None
+                    params['Compra_Mensual'] = val
+                elif norm_key == 'UTILIDAD':
+                    if val is not None:
+                        try:
+                            s = re.sub(r"[^0-9.,\-]", "", str(val))
+                            if s == '':
+                                val = None
+                            else:
+                                if s.count(',') > 0 and s.count('.') == 0:
+                                    s = s.replace(',', '.')
+                                elif s.count(',') > 0 and s.count('.') > 0:
+                                    if s.rfind('.') > s.rfind(','):
+                                        s = s.replace(',', '')
+                                    else:
+                                        s = s.replace('.', '').replace(',', '.')
+                                d = Decimal(s)
+                                val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            try:
+                                val = Decimal(str(float(str(val).replace(',', '.'))))
+                            except Exception:
+                                val = None
+                    params['Utilidad'] = val
+                elif '%' in norm_key and 'UTILIDAD' in norm_key:
+                    if val is not None:
+                        try:
+                            s = re.sub(r"[^0-9.,\-]", "", str(val))
+                            if s == '':
+                                val = None
+                            else:
+                                if s.count(',') > 0 and s.count('.') == 0:
+                                    s = s.replace(',', '.')
+                                elif s.count(',') > 0 and s.count('.') > 0:
+                                    if s.rfind('.') > s.rfind(','):
+                                        s = s.replace(',', '')
+                                    else:
+                                        s = s.replace('.', '').replace(',', '.')
+                                d = Decimal(s)
+                                val = d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                        except Exception:
+                            try:
+                                val = Decimal(str(float(str(val).replace(',', '.'))))
+                            except Exception:
+                                val = None
+                    params['Porcentaje_Utilidad'] = val
+                elif 'VALIDACION' in norm_key:
+                    params['Validacion'] = val
+                elif 'PROVEEDOR' in norm_key:
+                    params['Proveedor'] = val
+
+            # Safety: convert ints to strings for textual columns where appropriate
+            for k in list(params.keys()):
+                v = params[k]
+                if isinstance(v, int) and k not in ('Viajes_Presupuestados',):
+                    try:
+                        params[k] = str(v)
+                    except Exception:
+                        pass
+
+            # Log params
+            try:
+                def _serialize_val(v):
+                    if v is None:
+                        return None
+                    try:
+                        if isinstance(v, _dt):
+                            return v.isoformat()
+                    except Exception:
+                        pass
+                    try:
+                        if isinstance(v, Decimal):
+                            return str(v)
+                    except Exception:
+                        pass
+                    return v
+
+                loggable = {k: _serialize_val(v) for k, v in params.items()}
+                # logging.getLogger('operations').info(f"Presupuesto insert fila {idx}: {loggable}")
+            except Exception as log_ex:
+                logging.debug(f"No se pudo serializar params para logging en fila {idx}: {log_ex}")
+
+            all_params_list.append(params)
+        
+        # Ejecutar BULK INSERT optimizado
+        total_inserted = _bulk_insert_with_fallback(db, insert_sql, all_params_list, "presupuesto_tmp")
+
+        # After inserts, call post-processing SP if provided
+        if username and original_name:
+            processed_name = original_name
+            if processed_name.lower().startswith('temp_'):
+                processed_name = processed_name[5:]
+            
+            logging.getLogger('operations').info(f"Ejecutando Procedure para Presupuesto usuario={username}, archivo={processed_name}")
+            
+            try:
+                # Hacer commit antes de ejecutar el SP para cerrar la transacción actual
+                db.commit()
+                logging.getLogger('operations').info("Commit realizado antes de ejecutar SP")
+                
+                # Obtener la conexión raw de pyodbc
+                raw_conn = db.connection().connection
+                cursor = raw_conn.cursor()
+                
+                # Ejecutar el SP
+                cursor.execute(
+                    "EXEC dbo.sp_proc_ontime ?, ?, 14",
+                    (username, processed_name)
+                )
+                
+                # Iterar por todos los resultsets
+                error_msg = None
+                error_severity = 0
+                error_state = 0
+                resultset_count = 0
+                
+                try:
+                    while True:
+                        resultset_count += 1
+                        logging.getLogger('operations').info(f"Procesando resultset #{resultset_count}")
+                        
+                        try:
+                            rows = cursor.fetchall()
+                            if rows and len(rows) > 0:
+                                logging.getLogger('operations').info(f"Resultset #{resultset_count} tiene {len(rows)} fila(s)")
+                                last_row = rows[-1]
+                                
+                                if cursor.description:
+                                    col_names = [col[0].lower() for col in cursor.description]
+                                    logging.getLogger('operations').info(f"Columnas: {col_names}")
+                                    
+                                    error_msg_idx = next((i for i, name in enumerate(col_names) if 'error_msg' in name.lower()), None)
+                                    error_severity_idx = next((i for i, name in enumerate(col_names) if 'error_severity' in name.lower()), None)
+                                    error_state_idx = next((i for i, name in enumerate(col_names) if 'error_state' in name.lower()), None)
+                                    
+                                    if error_msg_idx is not None:
+                                        error_msg = last_row[error_msg_idx] if error_msg_idx is not None else None
+                                        error_severity = last_row[error_severity_idx] if error_severity_idx is not None else 0
+                                        error_state = last_row[error_state_idx] if error_state_idx is not None else 0
+                                        logging.getLogger('operations').info(f"error_msg: '{error_msg}', error_severity: {error_severity}, error_state: {error_state}")
+                            else:
+                                logging.getLogger('operations').info(f"Resultset #{resultset_count} vacío")
+                        except Exception as fetch_ex:
+                            logging.getLogger('operations').info(f"No se pudieron obtener filas: {fetch_ex}")
+                        
+                        # Avanzar al siguiente resultset
+                        try:
+                            if not cursor.nextset():
+                                logging.getLogger('operations').info(f"No hay más resultsets. Total: {resultset_count}")
+                                break
+                        except Exception as nextset_ex:
+                            logging.getLogger('operations').info(f"Error en nextset (fin de resultsets): {nextset_ex}")
+                            break
+                    
+                    # Verificar si hubo error
+                    if error_state and error_state > 0 and error_msg and str(error_msg).strip():
+                        logging.getLogger('operations').error(f"=" * 80)
+                        logging.getLogger('operations').error(f"ERROR EN STORED PROCEDURE sp_proc_ontime")
+                        logging.getLogger('operations').error(f"Usuario: {username}, Archivo: {processed_name}")
+                        logging.getLogger('operations').error(f"Error State: {error_state}")
+                        logging.getLogger('operations').error(f"Error Severity: {error_severity}")
+                        logging.getLogger('operations').error(f"Error Message: {error_msg}")
+                        logging.getLogger('operations').error(f"=" * 80)
+                        raise Exception(f"Error en sp_proc_ontime: {error_msg} (State: {error_state}, Severity: {error_severity})")
+                    else:
+                        logging.getLogger('operations').info(f"Procedure (Presupuesto) ejecutado exitosamente")
+                        
+                finally:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
+                    
+            except Exception as sp_ex:
+                error_msg = str(sp_ex)
+                
+                # Si es un error que ya procesamos, re-lanzar
+                if "Error en sp_proc_ontime:" in error_msg and "State:" in error_msg:
+                    raise
+                
+                # Error SQL inesperado
+                logging.getLogger('operations').error(f"=" * 80)
+                logging.getLogger('operations').error(f"ERROR EJECUTANDO STORED PROCEDURE")
+                logging.getLogger('operations').error(f"Usuario: {username}, Archivo: {processed_name}")
+                logging.getLogger('operations').error(f"Error: {error_msg}")
+                logging.getLogger('operations').error(f"=" * 80)
+                raise Exception(f"Error ejecutando sp_proc_ontime: {error_msg}")
+
+        logging.getLogger('operations').info(f"Presupuesto: procesadas {processed_count} filas, inserts afectaron aprox: {total_inserted}")
+        return processed_count
+    except Exception as e:
+        logging.getLogger('operations').error(f"Error procesando Presupuesto {file_path}: {e}")
+        try:
+            logging.getLogger('operations').error(f"Error procesando Presupuesto {file_path}: {e}")
+        except Exception:
+            pass
+        raise
