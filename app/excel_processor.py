@@ -436,8 +436,7 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
             
             # Pre-compilar conjuntos para verificaciones rápidas
             date_columns_set = {
-                "FECHA DE OFERTA", "CITA DE CARGA", "CITA DESCARGA",
-                "LLEGADA A CARGAR", "SALIDA DE CARGA", "LLEGADA A DESCARGA", "SALIDA DESCARGA"
+                "FECHA DE OFERTA", "CITA DE CARGA", "CITA DESCARGA"
             }
             numeric_columns_set = {
                 "TARIFA TRANSP.", "ACCESORIOS TRANSP", "IVA", "RETENCION", "TOTAL .L",
@@ -560,230 +559,178 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                 
                 # Procesar en lotes de 1000 para evitar límites de parámetros
                 batch_size = 1000
+                total_sp_executed = 0
+                total_sp_inserted = 0  # Registros realmente insertados en DB
+                total_sp_errors = 0
+                sp_errors_list = []  # Acumular errores para reportar al final
+                skipped_count = 0  # Registros no insertados por validación SP
+                
                 for batch_start in range(0, len(all_params_list), batch_size):
                     batch_end = min(batch_start + batch_size, len(all_params_list))
                     batch_params = all_params_list[batch_start:batch_end]
                     
-                    # Ejecutar el SP para cada registro en el lote
-                    for params in batch_params:
-                        db.execute(text(exec_sql), params)
+                    # Ejecutar el SP para cada registro en el lote con captura granular de errores
+                    for record_idx, params in enumerate(batch_params, start=batch_start + 1):
+                        try:
+                            # Ejecutar el SP
+                            db.execute(text(exec_sql), params)
+                            
+                            # Capturar @@ROWCOUNT para saber si se insertó realmente
+                            try:
+                                rowcount_result = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+                                rows_inserted = rowcount_result if rowcount_result is not None else 0
+                                
+                                if rows_inserted > 0:
+                                    total_sp_inserted += rows_inserted
+                                    ops_logger.debug(
+                                        f"Registro {record_idx}: Insertado exitosamente "
+                                        f"(Viaje={params.get('p2')}, Cliente={params.get('p6')})"
+                                    )
+                                else:
+                                    skipped_count += 1
+                                    ops_logger.warning(
+                                        f"Registro {record_idx}: NO se insertó (validación SP rechazó el registro porque ya existe en la BD) "
+                                        f"Viaje={params.get('p2')}, Cliente={params.get('p6')}"
+                                    )
+                            except Exception as rowcount_err:
+                                # Si no se puede obtener rowcount, asumir que se insertó
+                                total_sp_inserted += 1
+                                ops_logger.debug(
+                                    f"Registro {record_idx}: No se pudo verificar @@ROWCOUNT, "
+                                    f"asumiendo inserción exitosa (Viaje={params.get('p2')})"
+                                )
+                            
+                            total_sp_executed += 1
+                            
+                        except Exception as sp_record_err:
+                            total_sp_errors += 1
+                            error_type = type(sp_record_err).__name__
+                            error_msg = str(sp_record_err)
+                            
+                            # Extraer información del error
+                            error_details = {
+                                'record_num': record_idx,
+                                'total_records': len(all_params_list),
+                                'error_type': error_type,
+                                'error_msg': error_msg[:1000],  # Primeros 1000 caracteres
+                                'num_viaje': params.get('p2'),  # # viaje está en posición 2
+                                'cliente': params.get('p6'),    # CLIENTE está en posición 6
+                                'fecha_oferta': params.get('p1'),  # FECHA DE OFERTA está en posición 1
+                            }
+                            
+                            # Loguear error con contexto completo
+                            ops_logger.error(
+                                f"SP Error en registro {record_idx}/{len(all_params_list)}: "
+                                f"[{error_type}] {error_msg[:500]}"
+                            )
+                            ops_logger.error(
+                                f"  Contexto del registro: "
+                                f"Viaje={error_details['num_viaje']}, "
+                                f"Cliente={error_details['cliente']}, "
+                                f"Fecha={error_details['fecha_oferta']}"
+                            )
+                            
+                            # Loguear parámetros no-nulos para debugging (útil para validar datos)
+                            non_null_params = {
+                                k: v for k, v in params.items() 
+                                if v is not None
+                            }
+                            if non_null_params:
+                                ops_logger.debug(
+                                    f"  Parámetros no-nulos: {list(non_null_params.keys())}"
+                                )
+                            
+                            # Acumular error en lista para reporte final
+                            sp_errors_list.append(error_details)
+                            
+                            # Opción 1: Continuar procesando siguientes registros
+                            # continue
+                            
+                            # Opción 2: Detener en primer error (actual)
+                            raise
                     
-                    ops_logger.info(f"Lote procesado: {batch_start+1} a {batch_end} de {len(all_params_list)}")
+                    ops_logger.info(
+                        f"Lote {batch_start//batch_size + 1}: procesados {batch_end - batch_start} registros "
+                        f"(ejecutados: {total_sp_executed}, insertados: {total_sp_inserted}, "
+                        f"rechazados por validación: {skipped_count}, errores: {total_sp_errors})"
+                    )
                 
-                ops_logger.info("BULK INSERT completado exitosamente")
+                ops_logger.info(
+                    f"BULK INSERT completado. "
+                    f"RESUMEN FINAL - Registros procesados: {len(all_params_list)}, "
+                    f"Ejecutados: {total_sp_executed}, "
+                    f"Realmente insertados en DB: {total_sp_inserted}, "
+                    f"Rechazados por validación SP (viajes duplicados): {skipped_count}, "
+                    f"Errores: {total_sp_errors}"
+                )
 
                 # If we reach here, all executions for dbo.sp_ins_ontime succeeded.
                 # If a username was provided, call dbo.sp_procesa_ontime_complet with the user and processed filename
+            
                 try:
                     if username:
                         processed_name = name_only
                         if processed_name.lower().startswith('temp_'):
                             processed_name = processed_name[5:]
                         sp2_sql = "EXEC dbo.sp_procesa_ontime_complet :nombre_usuario, :name_file_procesado"
-                        logging.getLogger('operations').info(f"Ejecutando procedure para usuario={username}, archivo={processed_name}")
-                        db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
+                        
                         try:
-                            sp2_affected = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-                        except Exception:
-                            sp2_affected = None
-                        logging.getLogger('operations').info(f"Procedure @@ROWCOUNT={sp2_affected}")
-                    else:
-                        logging.getLogger('operations').info("No se proporcionó nombre de usuario; se omite la ejecución de procedure")
-                except Exception as sp2_err:
-                    logging.getLogger('operations').error(f"Error ejecutando procedure: {sp2_err}")
-                    raise
-
-                # -- NEW: after processing OCT25, look for a PPTO sheet for current year (e.g. 'PPTO 25')
-                try:
-                    yy2 = str(_dt.now().year % 100).zfill(2)
-                    ppto_sheet = None
-                    with pd.ExcelFile(file_path) as xls:
-                        for s in xls.sheet_names:
-                            if re.match(rf'^PPTO\s*{yy2}$', str(s).strip(), re.IGNORECASE):
-                                ppto_sheet = s
-                                break
-
-                    if ppto_sheet:
-                        logging.getLogger('operations').info(f"Se encontró hoja PPTO: '{ppto_sheet}'. Comprobando bitácora antes de insertar en dbo.presupuesto_tmp")
-                        # Check mi_bitacora_operaciones for prior load of this sheet name
-                        try:
-                            cnt = db.execute(text("SELECT COUNT(1) FROM dbo.mi_bitacora_operaciones WHERE name_file_load = :sheetname"), {"sheetname": ppto_sheet}).scalar()
-
-                            logging.getLogger('operations').info(f"Bitácora operaciones: {cnt} registros encontrados para la hoja '{ppto_sheet}'")
-                        except Exception:
-                            cnt = None
-
-                        if cnt is not None and int(cnt) > 0:
-                            logging.getLogger('operations').info(f"La hoja '{ppto_sheet}' ya figura en dbo.mi_bitacora_operaciones (count={cnt}), se omite la carga de presupuesto.")
-                        else:
-                            # Read PPTO sheet and map to presupuesto_tmp
-                            try:
-                                df_p = pd.read_excel(file_path, sheet_name=ppto_sheet, header=0)
-                                logging.getLogger('operations').info(f"Reading presupuesto sheet '{ppto_sheet}' with header=0")
-                            except Exception as read_p_err:
-                                logging.getLogger('operations').error(f"No se pudo leer la hoja {ppto_sheet}: {read_p_err}")
-                                raise
-
-                            df_p = df_p.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
-                            df_p = df_p.where(pd.notnull(df_p), None)
-
-                            # Omitir filas donde la primera columna esté vacía
-                            if df_p.shape[1] > 0:
-                                first_col_p = df_p.columns[0]
-                                before_p = len(df_p)
-                                try:
-                                    non_empty_mask_p = df_p[first_col_p].notnull() & (df_p[first_col_p].astype(str).str.strip() != '')
-                                except Exception:
-                                    non_empty_mask_p = df_p[first_col_p].notnull()
-                                df_p = df_p[non_empty_mask_p]
-                                dropped_p = before_p - len(df_p)
-                                if dropped_p > 0:
-                                    logging.getLogger('operations').info(f"Presupuesto: omitidas {dropped_p} filas que iniciaban con campo vacío en columna '{first_col_p}'")
-
-                            records_p = df_p.to_dict(orient='records')
-
-                            insert_sql_p = (
-                                "INSERT INTO dbo.presupuesto_tmp (Mes, Anio, Venta_Anio_Anterior, Escenario_Pesimista, Escenario_Conservador, Escenario_Optimista, Usuario_Creacion, Fecha_Creacion) "
-                                "VALUES (:Mes, :Anio, :Venta_Anio_Anterior, :Escenario_Pesimista, :Escenario_Conservador, :Escenario_Optimista, :Usuario_Creacion, :Fecha_Creacion)"
+                            logging.getLogger('operations').info(
+                                f"Ejecutando procedure sp_procesa_ontime_complet para usuario={username}, archivo={processed_name}"
                             )
-
-                            # helper to coerce numeric to Decimal
-                            def _to_decimal(v):
-                                if v is None:
-                                    return None
-                                try:
-                                    if isinstance(v, (int, float, Decimal)):
-                                        d = Decimal(str(v))
-                                        return d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                                    s = re.sub(r"[^0-9.,\-]", "", str(v))
-                                    if s == '':
-                                        return None
-                                    if s.count(',') > 0 and s.count('.') == 0:
-                                        s = s.replace(',', '.')
-                                    elif s.count(',') > 0 and s.count('.') > 0:
-                                        if s.rfind('.') > s.rfind(','):
-                                            s = s.replace(',', '')
-                                        else:
-                                            s = s.replace('.', '').replace(',', '.')
-                                    d = Decimal(s)
-                                    return d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                                except Exception:
-                                    try:
-                                        return Decimal(str(float(str(v).replace(',', '.')))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-                                    except Exception:
-                                        return None
-
-                            # Build normalized header map for scenario columns
-                            norm_map_p = {normalize_name(c): c for c in list(df_p.columns)}
-                            h_esc_pes = normalize_name('ESCENARIO PESIMISTA')
-                            h_esc_cons = normalize_name('ESCENARIO CONSERVADOR')
-                            h_esc_opt = normalize_name('ESCENARIO OPTIMISTA')
-
-                            total_inserted_p = 0
-                            current_year = _dt.now().year
-                            for idx_p, rec_p in enumerate(records_p, start=1):
-                                params_p = {
-                                    'Mes': None,
-                                    'Anio': current_year,
-                                    'Venta_Anio_Anterior': None,
-                                    'Escenario_Pesimista': None,
-                                    'Escenario_Conservador': None,
-                                    'Escenario_Optimista': None,
-                                    'Usuario_Creacion': username,
-                                    'Fecha_Creacion': None
-                                }
-
-                                # Mes from first physical column
-                                try:
-                                    mval = rec_p.get(first_col_p)
-                                except Exception:
-                                    mval = None
-                                if isinstance(mval, str):
-                                    mval = mval.replace('\xa0', ' ').strip()
-                                    if mval == '':
-                                        mval = None
-                                params_p['Mes'] = mval
-
-                                # Venta Año Anterior -> second column if present
-                                if df_p.shape[1] >= 2:
-                                    sec_col = df_p.columns[1]
-                                    v = rec_p.get(sec_col)
-                                    params_p['Venta_Anio_Anterior'] = _to_decimal(v)
-
-                                # Scenario columns by header name if present
-                                try:
-                                    if h_esc_pes in norm_map_p:
-                                        params_p['Escenario_Pesimista'] = _to_decimal(rec_p.get(norm_map_p[h_esc_pes]))
-                                except Exception:
-                                    params_p['Escenario_Pesimista'] = None
-                                try:
-                                    if h_esc_cons in norm_map_p:
-                                        params_p['Escenario_Conservador'] = _to_decimal(rec_p.get(norm_map_p[h_esc_cons]))
-                                except Exception:
-                                    params_p['Escenario_Conservador'] = None
-                                try:
-                                    if h_esc_opt in norm_map_p:
-                                        params_p['Escenario_Optimista'] = _to_decimal(rec_p.get(norm_map_p[h_esc_opt]))
-                                except Exception:
-                                    params_p['Escenario_Optimista'] = None
-
-                                # Log insert params for debugging
-                                try:
-                                    def _serialize_val(v):
-                                        if v is None:
-                                            return None
-                                        try:
-                                            if isinstance(v, _dt):
-                                                return v.isoformat()
-                                        except Exception:
-                                            pass
-                                        try:
-                                            if isinstance(v, Decimal):
-                                                return str(v)
-                                        except Exception:
-                                            pass
-                                        return v
-
-                                    loggable_p = {k: _serialize_val(v) for k, v in params_p.items()}
-                                   # logging.getLogger('operations').info(f"Presupuesto insert fila {idx_p}: {loggable_p}")
-                                except Exception:
-                                    pass
-
-                                db.execute(text(insert_sql_p), params_p)
-                                try:
-                                    affected_p = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-                                except Exception:
-                                    affected_p = None
-                                try:
-                                    total_inserted_p += int(affected_p) if affected_p is not None else 0
-                                except Exception:
-                                    pass
-
-                            logging.getLogger('operations').info(f"Presupuesto: insertadas aprox {total_inserted_p} filas desde hoja '{ppto_sheet}'")
-
-                            # After inserting presupuesto rows, call sp_proc_ontime with sheet name as processed file
+                            db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
+                            
+                            # Capturar @@ROWCOUNT para verificar filas afectadas
                             try:
-                                sp_ppto_sql = "EXEC dbo.sp_proc_ontime :nombre_usuario, :name_file_procesado,14"
-                                logging.getLogger('operations').info(f"Ejecutando Procedure para Presupuesto usuario={username}, hoja={ppto_sheet}")
-                                db.execute(text(sp_ppto_sql), {"nombre_usuario": username, "name_file_procesado": ppto_sheet})
-                                try:
-                                    sp_p_af = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-                                except Exception:
-                                    sp_p_af = None
-                                logging.getLogger('operations').info(f"Procedure (Presupuesto) @@ROWCOUNT={sp_p_af}")
-                            except Exception as sp_p_err:
-                                logging.getLogger('operations').error(f"Error ejecutando procedure para Presupuesto: {sp_p_err}")
-                                raise
-
+                                sp2_rowcount = db.execute(text("SELECT @@ROWCOUNT")).scalar()
+                                rows_affected = sp2_rowcount if sp2_rowcount is not None else 0
+                                
+                                logging.getLogger('operations').info(
+                                    f"Procedure sp_procesa_ontime_complet completado exitosamente. "
+                                    f"Filas afectadas: {rows_affected}, Usuario: {username}, Archivo: {processed_name}"
+                                )
+                            except Exception as rowcount_err:
+                                logging.getLogger('operations').warning(
+                                    f"No se pudo obtener @@ROWCOUNT de sp_procesa_ontime_complet: {str(rowcount_err)[:200]}"
+                                )
+                                logging.getLogger('operations').info(
+                                    f"Procedure sp_procesa_ontime_complet ejecutado (sin confirmación de filas afectadas)"
+                                )
+                                
+                        except Exception as sp2_exec_err:
+                            error_type = type(sp2_exec_err).__name__
+                            error_msg = str(sp2_exec_err)
+                            
+                            logging.getLogger('operations').error(
+                                f"Error ejecutando sp_procesa_ontime_complet: [{error_type}] {error_msg[:500]}"
+                            )
+                            logging.getLogger('operations').error(
+                                f"  Contexto: usuario={username}, archivo={processed_name}"
+                            )
+                            raise
                     else:
-                        logging.getLogger('operations').info(f"No se encontró hoja PPTO {yy2} en el libro; se omite carga de presupuesto.")
-                except Exception:
-                    # Any exception here should bubble up to outer handler to trigger rollback
+                        logging.getLogger('operations').info(
+                            "No se proporcionó nombre de usuario; se omite la ejecución de sp_procesa_ontime_complet"
+                        )
+                except Exception as sp2_err:
+                    error_type = type(sp2_err).__name__
+                    error_msg = str(sp2_err)
+                    
+                    logging.getLogger('operations').error(
+                        f"Error crítico en sp_procesa_ontime_complet: [{error_type}] {error_msg[:500]}"
+                    )
                     raise
-
+                    
+                # -- NEW: after processing OCT25, look for a PPTO sheet for current year (e.g. 'PPTO 25')
+               
                 # Commit once for the whole file (includes both SP calls and presupuesto inserts)
                 db.commit()
-                logging.getLogger('operations').info(f"Envío a SP completado. Enviadas: {len(records)}, total_affected_calc={total_affected}")
+                logging.getLogger('operations').info(
+                    f"Envío a SP completado exitosamente. "
+                    f"Registros procesados: {len(records)}, "
+                    f"Registros realmente insertados: {total_sp_inserted}, "
+                    f"Registros rechazados: {skipped_count}"
+                )
 
                 # Opción B: escribir archivo acumulado_<AAAA>.txt con el número de filas
                 #try:
