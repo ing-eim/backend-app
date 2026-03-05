@@ -571,13 +571,13 @@ async def procesar_incidencias(file: UploadFile = File(...), current_user: model
 @app.post("/procesar-pipeline-transporte/")
 async def procesar_pipeline_transporte(file: UploadFile = File(...), current_user: models.Usuario = Depends(get_current_user)):
     import os
-    # Validar nomenclatura: pipelineTransporte_sem_XX_MM-AAAA (XX semana, MM mes, AAAA año)
+    # Validar nomenclatura: pipelineTransporte_semXX_MM-AAAA (XX semana, MM mes, AAAA año)
     filename = file.filename or ""
     name_only, _ext = os.path.splitext(filename)
-    m = re.match(r"^pipelineTransporte_sem_(\d{1,2})_(\d{2})-(\d{4})$", name_only, re.IGNORECASE)
+    m = re.match(r"^pipelineTransporte_sem(\d{1,2})_(\d{2})-(\d{4})$", name_only, re.IGNORECASE)
     if not m:
         ops_logger.warning(f"Archivo pipeline transporte con nombre inválido recibido: {filename}")
-        raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'pipelineTransporte_sem_XX_MM-AAAA'")
+        raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'pipelineTransporte_semXX_MM-AAAA'")
     week = int(m.group(1))
     month = int(m.group(2))
     year = int(m.group(3))
