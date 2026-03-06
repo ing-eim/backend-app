@@ -794,6 +794,30 @@ async def procesar_disponibilidad_transporte(file: UploadFile = File(...), curre
         ops_logger.warning(f"Archivo disponibilidad transporte con mes/año inválido en el nombre: {filename}")
         raise HTTPException(status_code=400, detail="El mes o año en el nombre del archivo no es válido")
 
+    # Validar que es un día permitido para cargar archivo ventaPerdida
+    try:
+        from app.database import SessionLocal as _SessionLocal
+        with _SessionLocal() as _db_validate:
+            try:
+                sql_validate = "SELECT dbo.ValidateLoadFile('disponibilidadTransporte')"
+                result = _db_validate.execute(text(sql_validate)).scalar()
+                
+                if result != 1:
+                    ops_logger.warning(f"Archivo disponibilidadTransporte rechazado: No es un día permitido para cargar este tipo de archivo")
+                    raise HTTPException(status_code=400, detail="No es un día permitido para cargar archivos de disponibilidadTransporte. Consulte el calendario de cargas.")
+                else:
+                    ops_logger.info(f"Archivo disponibilidadTransporte validado: Es un día permitido para cargar")
+                    
+            except HTTPException:
+                raise
+            except Exception as e:
+                ops_logger.warning(f"No se pudo validar el día de carga (continuando): {e}")
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        ops_logger.warning(f"No se pudo validar archivo contra calendario de cargas; continuando con el procesamiento: {e}")
+
+
     # Verificar en mi_bitacora_operaciones si ya fue procesado
     try:
         from app.database import SessionLocal as _SessionLocal
@@ -1213,6 +1237,29 @@ async def procesar_venta_perdida(file: UploadFile = File(...), current_user: mod
         ops_logger.warning(f"Archivo ventaPerdida con mes/año inválido en el nombre: {name_only!r}")
         raise HTTPException(status_code=400, detail="El mes o año en el nombre del archivo no es válido")
 
+    # Validar que es un día permitido para cargar archivo ventaPerdida
+    try:
+        from app.database import SessionLocal as _SessionLocal
+        with _SessionLocal() as _db_validate:
+            try:
+                sql_validate = "SELECT dbo.ValidateLoadFile('ventaPerdida')"
+                result = _db_validate.execute(text(sql_validate)).scalar()
+                
+                if result != 1:
+                    ops_logger.warning(f"Archivo ventaPerdida rechazado: No es un día permitido para cargar este tipo de archivo")
+                    raise HTTPException(status_code=400, detail="No es un día permitido para cargar archivos de ventaPerdida. Consulte el calendario de cargas.")
+                else:
+                    ops_logger.info(f"Archivo ventaPerdida validado: Es un día permitido para cargar")
+                    
+            except HTTPException:
+                raise
+            except Exception as e:
+                ops_logger.warning(f"No se pudo validar el día de carga (continuando): {e}")
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        ops_logger.warning(f"No se pudo validar archivo contra calendario de cargas; continuando con el procesamiento: {e}")
+
     # Verificar en mi_bitacora_operaciones si ya fue procesado
     try:
         from app.database import SessionLocal as _SessionLocal
@@ -1421,6 +1468,31 @@ async def procesar_presupuesto(file: UploadFile = File(...), current_user: model
     if month < 1 or month > 12 or year < 2000 or year > 2100:
         ops_logger.warning(f"Archivo presupuesto con mes/año inválido en el nombre: {name_only!r}")
         raise HTTPException(status_code=400, detail="El mes o año en el nombre del archivo no es válido")
+
+    # Validar que es un día permitido para cargar archivo presupuesto
+    
+    try:
+        from app.database import SessionLocal as _SessionLocal
+        with _SessionLocal() as _db_validate:
+            try:
+                sql_validate = "SELECT dbo.ValidateLoadFile('presupuesto')"
+                result = _db_validate.execute(text(sql_validate)).scalar()
+                
+                if result != 1:
+                    ops_logger.warning(f"Archivo presupuesto rechazado: No es un día permitido para cargar este tipo de archivo")
+                    raise HTTPException(status_code=400, detail="No es un día permitido para cargar archivos de presupuesto. Consulte el calendario de cargas.")
+                else:
+                    ops_logger.info(f"Archivo presupuesto validado: Es un día permitido para cargar")
+                    
+            except HTTPException:
+                raise
+            except Exception as e:
+                ops_logger.warning(f"No se pudo validar el día de carga (continuando): {e}")
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        ops_logger.warning(f"No se pudo validar archivo contra calendario de cargas; continuando con el procesamiento: {e}")
+    
 
     # Verificar en mi_bitacora_operaciones si ya fue procesado
     try:
