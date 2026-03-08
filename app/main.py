@@ -690,6 +690,30 @@ async def procesar_pipeline_comercial(file: UploadFile = File(...), current_user
         ops_logger.warning(f"Archivo pipeline comercial con semana/dia/mes/año inválido en el nombre: {filename}")
         raise HTTPException(status_code=400, detail="La semana, día, mes o año en el nombre del archivo no es válido")
 
+
+    # Validar que es un día permitido para cargar archivo pipeline comercial, usando dbo.ValidateLoadFile('pipelineComercial') - si falla la validación, rechazar carga con mensaje específico; si falla la consulta, registrar advertencia y continuar con procesamiento (no bloquear carga)
+    try:
+        from app.database import SessionLocal as _SessionLocal
+        with _SessionLocal() as _db_validate:
+            try:
+                sql_validate = "SELECT dbo.ValidateLoadFile('Pipeline Comercial')"
+                result = _db_validate.execute(text(sql_validate)).scalar()
+                
+                if result != 1:
+                    ops_logger.warning(f"Archivo pipeline comercial rechazado: No es un día permitido para cargar este tipo de archivo")
+                    raise HTTPException(status_code=400, detail="No es un día permitido para cargar archivos de pipeline comercial. Consulte el calendario de cargas.")
+                else:
+                    ops_logger.info(f"Archivo pipeline comercial validado: Es un día permitido para cargar")
+                    
+            except HTTPException:
+                raise
+            except Exception as e:
+                ops_logger.warning(f"No se pudo validar el día de carga (continuando): {e}")
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        ops_logger.warning(f"No se pudo validar archivo contra calendario de cargas; continuando con el procesamiento: {e}")
+
     # Verificar en mi_bitacora_operaciones si ya fue procesado
     try:
         from app.database import SessionLocal as _SessionLocal
