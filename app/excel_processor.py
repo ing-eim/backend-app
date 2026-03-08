@@ -3471,7 +3471,7 @@ def process_pronostico_cobranza(file_path: str, db: object, username: Optional[s
 def process_presupuesto(file_path: str, db: object, username: Optional[str] = None, original_name: Optional[str] = None) -> int:
     """Process presupuesto files into dbo.presupuesto_tmp.
 
-    - Filename expected format: presupuesto_MM_AAAA (MM = month, AAAA = year) - validado por caller
+    - Filename expected format: presupuesto_MM-AAAA (MM = month, AAAA = year) - validado por caller
     - Reads the FIRST sheet of the workbook (sheet index 0)
     - Headers are on row 3 (Excel), data starts on row 4 (pandas header=2)
     - Omits rows whose first column is empty.

@@ -1478,14 +1478,14 @@ async def procesar_pronostico_cobranza(file: UploadFile = File(...), current_use
 @app.post("/procesar-presupuesto/")
 @app.post("/procesar-presupuesto")
 async def procesar_presupuesto(file: UploadFile = File(...), current_user: models.Usuario = Depends(get_current_user)):
-    """Procesar archivo presupuesto con nomenclatura presupuesto_MM_AAAA"""
+    """Procesar archivo presupuesto con nomenclatura presupuesto_MM-AAAA"""
     # Validar nomenclatura: presupuesto_MM_AAAA (MM mes 2 dígitos, AAAA año 4 dígitos)
     filename = file.filename or ""
     name_only, _ext = os.path.splitext(filename)
     m = re.match(r"^presupuesto_(\d{2})-(\d{4})$", name_only, re.IGNORECASE)
     if not m:
         ops_logger.warning(f"Archivo presupuesto con nombre inválido recibido: {filename!r}")
-        raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'presupuesto_MM_AAAA'")
+        raise HTTPException(status_code=400, detail="El nombre del archivo no cumple con el formato requerido 'presupuesto_MM-AAAA'")
 
     month = int(m.group(1))
     year = int(m.group(2))
