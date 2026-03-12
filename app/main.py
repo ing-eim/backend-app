@@ -226,6 +226,7 @@ async def procesar_excel(file: UploadFile = File(...), current_user: models.Usua
                 return JSONResponse(status_code=500, content={"rows_read": 0, "error": "Error al procesar archivo; verificar api.log"})
 
         # Guardar resultados leídos en archivo .txt: acumulado_<AAAA>.txt
+        '''
         out_filename = f"acumulado_{year}.txt"
         try:
             with open(out_filename, "w", encoding="utf-8") as out_f:
@@ -241,8 +242,9 @@ async def procesar_excel(file: UploadFile = File(...), current_user: models.Usua
                 pass
             return JSONResponse(status_code=500, content={"rows_read": 0, "error": f"Error al guardar el archivo de salida: {wf_err}"})
 
-        rows_count = len(data)
-
+        
+        '''
+        rows_count = data
         # Elimina el archivo temporal después de procesar
         try:
             safe_remove(file_location)

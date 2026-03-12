@@ -386,7 +386,7 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
             ]
 
             param_names = [f"p{i+1}" for i in range(len(ordered_cols))]
-            exec_sql = "EXEC dbo.sp_ins_ontime " + ", ".join(f":{n}" for n in param_names)
+            exec_sql = "SET NOCOUNT ON; EXEC dbo.sp_ins_ontime " + ", ".join(f":{n}" for n in param_names)
 
             # Build normalized map of record keys to original keys for fuzzy lookup
             normalized_key_map = {normalize_name(k): k for k in original_columns}
@@ -563,7 +563,9 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                 total_sp_inserted = 0  # Registros realmente insertados en DB
                 total_sp_errors = 0
                 sp_errors_list = []  # Acumular errores para reportar al final
-                skipped_count = 0  # Registros no insertados por validación SP
+                skipped_count = 0  # Registros no insertados cuando SP reporta rechazo explícito
+                unknown_count = 0  # SP ejecutado sin señal explícita de éxito/rechazo
+                successful_viajes = []  # Viajes aceptados por sp_ins_ontime
                 
                 for batch_start in range(0, len(all_params_list), batch_size):
                     batch_end = min(batch_start + batch_size, len(all_params_list))
@@ -571,33 +573,76 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                     
                     # Ejecutar el SP para cada registro en el lote con captura granular de errores
                     for record_idx, params in enumerate(batch_params, start=batch_start + 1):
+                        sp_exec_result = None
                         try:
-                            # Ejecutar el SP
-                            db.execute(text(exec_sql), params)
-                            
-                            # Capturar @@ROWCOUNT para saber si se insertó realmente
-                            try:
-                                rowcount_result = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-                                rows_inserted = rowcount_result if rowcount_result is not None else 0
-                                
-                                if rows_inserted > 0:
-                                    total_sp_inserted += rows_inserted
-                                    ops_logger.debug(
-                                        f"Registro {record_idx}: Insertado exitosamente "
-                                        f"(Viaje={params.get('p2')}, Cliente={params.get('p6')})"
-                                    )
-                                else:
-                                    skipped_count += 1
-                                    ops_logger.warning(
-                                        f"Registro {record_idx}: NO se insertó (validación SP rechazó el registro porque ya existe en la BD) "
-                                        f"Viaje={params.get('p2')}, Cliente={params.get('p6')}"
-                                    )
-                            except Exception as rowcount_err:
-                                # Si no se puede obtener rowcount, asumir que se insertó
+                            # Ejecutar el SP                            
+                            sp_exec_result = db.execute(text(exec_sql), params)
+
+                            # Interpretar resultado del SP únicamente con señal explícita.
+                            sp_rejected_explicitly = False
+                            sp_inserted_explicitly = False
+                            explicit_signal_found = False
+                            sp_status_text = None
+                            sp_inserted_raw = None
+                            sp_tmp_count_raw = None
+                            if getattr(sp_exec_result, 'returns_rows', False):
+                                try:
+                                    sp_row = sp_exec_result.fetchone()
+                                    if sp_row is not None:
+                                        if hasattr(sp_row, '_mapping'):
+                                            sp_map = {str(k).upper(): v for k, v in sp_row._mapping.items()}
+                                        else:
+                                            sp_map = {}
+
+                                        if 'INSERTED' in sp_map:
+                                            explicit_signal_found = True
+                                            inserted_val = sp_map.get('INSERTED')
+                                            sp_inserted_raw = inserted_val
+                                            if inserted_val in (1, True, '1', 'TRUE'):
+                                                sp_inserted_explicitly = True
+                                            elif inserted_val in (0, False, '0', 'FALSE'):
+                                                sp_rejected_explicitly = True
+
+                                        status_val = sp_map.get('STATUS')
+                                        if status_val is not None:
+                                            explicit_signal_found = True
+                                            status_text = str(status_val).strip().upper()
+                                            sp_status_text = status_text
+                                            if status_text in {'OK', 'INSERTED', 'SUCCESS'}:
+                                                sp_inserted_explicitly = True
+                                            elif status_text in {'REJECTED', 'REJECTED_DUPLICATE', 'SKIPPED', 'DUPLICATE'}:
+                                                sp_rejected_explicitly = True
+
+                                        if 'ONTIME_TMP_COUNT_FOR_VIAJE' in sp_map:
+                                            sp_tmp_count_raw = sp_map.get('ONTIME_TMP_COUNT_FOR_VIAJE')
+                                except Exception:
+                                    # Si no se puede leer fila devuelta, no asumir rechazo.
+                                    pass
+
+                            if sp_rejected_explicitly and not sp_inserted_explicitly:
+                                skipped_count += 1
+                                ops_logger.warning(
+                                    f"Registro {record_idx}: NO se insertó (SP reportó rechazo explícito) "
+                                    f"Viaje={params.get('p2')}, Cliente={params.get('p6')}, "
+                                    f"SP_STATUS={sp_status_text}, SP_INSERTED={sp_inserted_raw}, "
+                                    f"TMP_COUNT={sp_tmp_count_raw}"
+                                )
+                            elif sp_inserted_explicitly:
                                 total_sp_inserted += 1
-                                ops_logger.debug(
-                                    f"Registro {record_idx}: No se pudo verificar @@ROWCOUNT, "
-                                    f"asumiendo inserción exitosa (Viaje={params.get('p2')})"
+                                successful_viajes.append(params.get('p2'))
+                                ops_logger.info(
+                                    f"Registro {record_idx}: Insertado (confirmado por SP) "
+                                    f"(Viaje={params.get('p2')}, Cliente={params.get('p6')}, "
+                                    f"SP_STATUS={sp_status_text}, SP_INSERTED={sp_inserted_raw}, "
+                                    f"TMP_COUNT={sp_tmp_count_raw})"
+                                )
+                            else:
+                                unknown_count += 1
+                                ops_logger.warning(
+                                    f"Registro {record_idx}: SP ejecutado sin confirmación explícita de inserción "
+                                    f"(Viaje={params.get('p2')}, Cliente={params.get('p6')}, "
+                                    f"SP_STATUS={sp_status_text}, SP_INSERTED={sp_inserted_raw}, "
+                                    f"TMP_COUNT={sp_tmp_count_raw})"
                                 )
                             
                             total_sp_executed += 1
@@ -619,11 +664,11 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                             }
                             
                             # Loguear error con contexto completo
-                            ops_logger.error(
+                            ops_logger.info(
                                 f"SP Error en registro {record_idx}/{len(all_params_list)}: "
                                 f"[{error_type}] {error_msg[:500]}"
                             )
-                            ops_logger.error(
+                            ops_logger.info(
                                 f"  Contexto del registro: "
                                 f"Viaje={error_details['num_viaje']}, "
                                 f"Cliente={error_details['cliente']}, "
@@ -644,15 +689,42 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                             sp_errors_list.append(error_details)
                             
                             # Opción 1: Continuar procesando siguientes registros
-                            # continue
+                            #vcontinue
                             
                             # Opción 2: Detener en primer error (actual)
                             raise
+                        finally:
+                            # IMPORTANTE con pyodbc + SQL Server (sin MARS): consumir y cerrar
+                            # todos los resultsets del EXEC para evitar
+                            # "Connection is busy with results for another command".
+                            if sp_exec_result is not None:
+                                try:
+                                    if getattr(sp_exec_result, 'returns_rows', False):
+                                        try:
+                                            sp_exec_result.fetchall()
+                                        except Exception:
+                                            pass
+
+                                    raw_cursor = getattr(sp_exec_result, 'cursor', None)
+                                    if raw_cursor is not None:
+                                        try:
+                                            while raw_cursor.nextset():
+                                                try:
+                                                    raw_cursor.fetchall()
+                                                except Exception:
+                                                    pass
+                                        except Exception:
+                                            pass
+                                finally:
+                                    try:
+                                        sp_exec_result.close()
+                                    except Exception:
+                                        pass
                     
                     ops_logger.info(
                         f"Lote {batch_start//batch_size + 1}: procesados {batch_end - batch_start} registros "
                         f"(ejecutados: {total_sp_executed}, insertados: {total_sp_inserted}, "
-                        f"rechazados por validación: {skipped_count}, errores: {total_sp_errors})"
+                        f"rechazados por validación: {skipped_count}, sin confirmación: {unknown_count}, errores: {total_sp_errors})"
                     )
                 
                 ops_logger.info(
@@ -660,41 +732,115 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                     f"RESUMEN FINAL - Registros procesados: {len(all_params_list)}, "
                     f"Ejecutados: {total_sp_executed}, "
                     f"Realmente insertados en DB: {total_sp_inserted}, "
-                    f"Rechazados por validación SP (viajes duplicados): {skipped_count}, "
+                    f"Rechazados por SP (señal explícita): {skipped_count}, "
+                    f"Sin confirmación explícita: {unknown_count}, "
                     f"Errores: {total_sp_errors}"
                 )
 
+                # Confirmar la carga base antes del segundo SP para evitar
+                # que un rollback posterior revierta los inserts exitosos de OnTime_tmp.
+                db.commit()
+                logging.getLogger('operations').info(
+                    "Commit intermedio aplicado: inserciones de sp_ins_ontime confirmadas"
+                )
+
+                # Diagnóstico: validar persistencia en OnTime_tmp de viajes insertados
+                try:
+                    unique_success_ids = []
+                    for v in successful_viajes:
+                        try:
+                            if v is None:
+                                continue
+                            vid = int(Decimal(str(v)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+                            if vid not in unique_success_ids:
+                                unique_success_ids.append(vid)
+                        except Exception:
+                            continue
+
+                    if unique_success_ids:
+                        for vid in unique_success_ids:
+                            cnt_tmp = db.execute(
+                                text("""
+                                    SELECT COUNT(1)
+                                    FROM dbo.OnTime_tmp
+                                    WHERE TRY_CONVERT(INT, REPLACE(CAST([# viaje] AS NVARCHAR(50)), '.00', '')) = :id_viaje
+                                """),
+                                {"id_viaje": vid}
+                            ).scalar()
+                            logging.getLogger('operations').info(
+                                f"Post-commit SP1 verificación: OnTime_tmp viaje={vid}, filas={cnt_tmp or 0}"
+                            )
+                except Exception as verify_sp1_err:
+                    logging.getLogger('operations').warning(
+                        f"No se pudo validar OnTime_tmp después de SP1: {str(verify_sp1_err)[:300]}"
+                    )
+
                 # If we reach here, all executions for dbo.sp_ins_ontime succeeded.
                 # If a username was provided, call dbo.sp_procesa_ontime_complet with the user and processed filename
-            
+                
                 try:
                     if username:
                         processed_name = name_only
                         if processed_name.lower().startswith('temp_'):
                             processed_name = processed_name[5:]
-                        sp2_sql = "EXEC dbo.sp_procesa_ontime_complet :nombre_usuario, :name_file_procesado"
+                        sp2_sql = "SET NOCOUNT ON; EXEC dbo.sp_procesa_ontime_complet :nombre_usuario, :name_file_procesado"
                         
                         try:
                             logging.getLogger('operations').info(
                                 f"Ejecutando procedure sp_procesa_ontime_complet para usuario={username}, archivo={processed_name}"
                             )
-                            db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
-                            
-                            # Capturar @@ROWCOUNT para verificar filas afectadas
+                            sp2_result = db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
+
+                            # Consumir/cerrar todos los resultsets para liberar la conexión.
                             try:
-                                sp2_rowcount = db.execute(text("SELECT @@ROWCOUNT")).scalar()
-                                rows_affected = sp2_rowcount if sp2_rowcount is not None else 0
-                                
-                                logging.getLogger('operations').info(
-                                    f"Procedure sp_procesa_ontime_complet completado exitosamente. "
-                                    f"Filas afectadas: {rows_affected}, Usuario: {username}, Archivo: {processed_name}"
-                                )
-                            except Exception as rowcount_err:
+                                if getattr(sp2_result, 'returns_rows', False):
+                                    try:
+                                        sp2_result.fetchall()
+                                    except Exception:
+                                        pass
+
+                                sp2_cursor = getattr(sp2_result, 'cursor', None)
+                                if sp2_cursor is not None:
+                                    try:
+                                        while sp2_cursor.nextset():
+                                            try:
+                                                sp2_cursor.fetchall()
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+                            finally:
+                                try:
+                                    sp2_result.close()
+                                except Exception:
+                                    pass
+
+                            logging.getLogger('operations').info(
+                                f"Procedure sp_procesa_ontime_complet completado exitosamente. "
+                                f"Usuario: {username}, Archivo: {processed_name}"
+                            )
+
+                            # Diagnóstico: estado después del SP2 para los viajes insertados
+                            try:
+                                for vid in unique_success_ids if 'unique_success_ids' in locals() else []:
+                                    cnt_tmp_after = db.execute(
+                                        text("""
+                                            SELECT COUNT(1)
+                                            FROM dbo.OnTime_tmp
+                                            WHERE TRY_CONVERT(INT, REPLACE(CAST([# viaje] AS NVARCHAR(50)), '.00', '')) = :id_viaje
+                                        """),
+                                        {"id_viaje": vid}
+                                    ).scalar()
+                                    cnt_viaje_after = db.execute(
+                                        text("SELECT COUNT(1) FROM dbo.dwh_viaje WHERE id_viaje = :id_viaje"),
+                                        {"id_viaje": vid}
+                                    ).scalar()
+                                    logging.getLogger('operations').info(
+                                        f"Post-SP2 verificación: viaje={vid}, OnTime_tmp={cnt_tmp_after or 0}, dwh_viaje={cnt_viaje_after or 0}"
+                                    )
+                            except Exception as verify_sp2_err:
                                 logging.getLogger('operations').warning(
-                                    f"No se pudo obtener @@ROWCOUNT de sp_procesa_ontime_complet: {str(rowcount_err)[:200]}"
-                                )
-                                logging.getLogger('operations').info(
-                                    f"Procedure sp_procesa_ontime_complet ejecutado (sin confirmación de filas afectadas)"
+                                    f"No se pudo validar estado después de SP2: {str(verify_sp2_err)[:300]}"
                                 )
                                 
                         except Exception as sp2_exec_err:
@@ -723,13 +869,14 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                     
                 # -- NEW: after processing OCT25, look for a PPTO sheet for current year (e.g. 'PPTO 25')
                
-                # Commit once for the whole file (includes both SP calls and presupuesto inserts)
+                # Commit de la segunda fase (post-procesamiento)
                 db.commit()
                 logging.getLogger('operations').info(
                     f"Envío a SP completado exitosamente. "
                     f"Registros procesados: {len(records)}, "
                     f"Registros realmente insertados: {total_sp_inserted}, "
-                    f"Registros rechazados: {skipped_count}"
+                    f"Registros rechazados: {skipped_count}, "
+                    f"Registros sin confirmación: {unknown_count}"
                 )
 
                 # Opción B: escribir archivo acumulado_<AAAA>.txt con el número de filas
@@ -763,7 +910,7 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                 # Propagate exception to caller to indicate the file-level failure
                 raise
 
-        return records
+        return total_sp_inserted
     except Exception as e:
         logging.getLogger('operations').error(f"Error procesando archivo Excel {file_path}: {str(e)}")
         try:
