@@ -790,12 +790,27 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                 f"Ejecutando procedure sp_procesa_ontime_complet para usuario={username}, archivo={processed_name}"
                             )
                             sp2_result = db.execute(text(sp2_sql), {"nombre_usuario": username, "name_file_procesado": processed_name})
+                            logging.getLogger('operations').info(
+                                f"{sp2_sql} ejecutado, procesando resultados..."
+                            )
+                            sp2_resultsets = []
+
+                            def _row_to_dict(row_obj, columns: list) -> dict:
+                                if hasattr(row_obj, '_mapping'):
+                                    return {str(k): v for k, v in row_obj._mapping.items()}
+                                try:
+                                    return {str(columns[i]): row_obj[i] for i in range(min(len(columns), len(row_obj)))}
+                                except Exception:
+                                    return {}
 
                             # Consumir/cerrar todos los resultsets para liberar la conexión.
                             try:
                                 if getattr(sp2_result, 'returns_rows', False):
                                     try:
-                                        sp2_result.fetchall()
+                                        first_rows = sp2_result.fetchall()
+                                        first_cols = list(getattr(sp2_result, 'keys', lambda: [])() or [])
+                                        if first_rows:
+                                            sp2_resultsets.append([_row_to_dict(r, first_cols) for r in first_rows])
                                     except Exception:
                                         pass
 
@@ -804,7 +819,12 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                     try:
                                         while sp2_cursor.nextset():
                                             try:
-                                                sp2_cursor.fetchall()
+                                                if sp2_cursor.description is None:
+                                                    continue
+                                                next_cols = [str(c[0]) for c in sp2_cursor.description]
+                                                next_rows = sp2_cursor.fetchall()
+                                                if next_rows:
+                                                    sp2_resultsets.append([_row_to_dict(r, next_cols) for r in next_rows])
                                             except Exception:
                                                 pass
                                     except Exception:
@@ -814,6 +834,26 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                     sp2_result.close()
                                 except Exception:
                                     pass
+
+                            final_sp2_row = None
+                            for rs in sp2_resultsets:
+                                for row in rs:
+                                    row_upper = {str(k).upper(): v for k, v in row.items()}
+                                    if 'STATUS' in row_upper:
+                                        final_sp2_row = row_upper
+
+                            if final_sp2_row is not None:
+                                ops_logger.info(
+                                    f"sp_procesa_ontime_complet resultset final: {final_sp2_row}"
+                                )
+                                if str(final_sp2_row.get('STATUS', '')).upper() == 'ERROR':
+                                    raise RuntimeError(
+                                        f"sp_procesa_ontime_complet devolvió STATUS=ERROR: {final_sp2_row}"
+                                    )
+                            else:
+                                ops_logger.warning(
+                                    "sp_procesa_ontime_complet se ejecutó pero no devolvió un rowset con columna STATUS"
+                                )
 
                             logging.getLogger('operations').info(
                                 f"Procedure sp_procesa_ontime_complet completado exitosamente. "
