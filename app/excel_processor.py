@@ -794,7 +794,6 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                 f"{sp2_sql} ejecutado, procesando resultados..."
                             )
                             sp2_resultsets = []
-
                             def _row_to_dict(row_obj, columns: list) -> dict:
                                 if hasattr(row_obj, '_mapping'):
                                     return {str(k): v for k, v in row_obj._mapping.items()}
@@ -802,7 +801,6 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                     return {str(columns[i]): row_obj[i] for i in range(min(len(columns), len(row_obj)))}
                                 except Exception:
                                     return {}
-
                             # Consumir/cerrar todos los resultsets para liberar la conexión.
                             try:
                                 if getattr(sp2_result, 'returns_rows', False):
@@ -813,7 +811,6 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                             sp2_resultsets.append([_row_to_dict(r, first_cols) for r in first_rows])
                                     except Exception:
                                         pass
-
                                 sp2_cursor = getattr(sp2_result, 'cursor', None)
                                 if sp2_cursor is not None:
                                     try:
@@ -834,14 +831,12 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                     sp2_result.close()
                                 except Exception:
                                     pass
-
                             final_sp2_row = None
                             for rs in sp2_resultsets:
                                 for row in rs:
                                     row_upper = {str(k).upper(): v for k, v in row.items()}
                                     if 'STATUS' in row_upper:
                                         final_sp2_row = row_upper
-
                             if final_sp2_row is not None:
                                 ops_logger.info(
                                     f"sp_procesa_ontime_complet resultset final: {final_sp2_row}"
@@ -854,12 +849,10 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                 ops_logger.warning(
                                     "sp_procesa_ontime_complet se ejecutó pero no devolvió un rowset con columna STATUS"
                                 )
-
                             logging.getLogger('operations').info(
                                 f"Procedure sp_procesa_ontime_complet completado exitosamente. "
                                 f"Usuario: {username}, Archivo: {processed_name}"
                             )
-
                             # Diagnóstico: estado después del SP2 para los viajes insertados
                             try:
                                 for vid in unique_success_ids if 'unique_success_ids' in locals() else []:
@@ -1864,7 +1857,10 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
     Rules:
     - Filename convention verified by caller (endpoint); this function expects to receive
       the saved temp file path and a DB session.
-    - Select sheet whose name contains 'OCT25' (case-insensitive).
+        - Select all sheets whose name matches MMMYY (case-insensitive), where MMM is a
+            3-letter month abbreviation and YY are the last 2 digits of year.
+        - Skip sheets already loaded in dbo.dwh_DisponibilidadTransporte based on
+            dwh_DisponibilidadTransporte.sheet_origen.
     - Read deterministically with header=2 (headers on Excel row 3) and drop first physical column
       so logical columns start at physical column 2.
     - Omit rows whose first logical column (after drop) is empty/null.
@@ -1881,23 +1877,61 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
     except Exception:
         pass
     try:
-        # Find OCT25 sheet
-        sheet_to_use = None
+        # Find sheets matching MMMYY (e.g. ENE25, FEB26, OCT 25)
+        month_year_pattern = re.compile(r'^[A-Z]{3}\s?\d{2}$', re.IGNORECASE)
+        sheets_to_process = []
         with pd.ExcelFile(file_path) as xls:
             for s in xls.sheet_names:
-                if 'OCT25' in s.upper() or 'OCT 25' in s.upper():
-                    sheet_to_use = s
-                    break
-        if sheet_to_use is None:
-            raise ValueError("Hoja 'OCT25' no encontrada en el archivo Excel")
+                if month_year_pattern.match(str(s).strip()):
+                    sheets_to_process.append(s)
+        if not sheets_to_process:
+            raise ValueError("No se encontraron hojas con formato MMMYY en el archivo Excel")
 
-        # Read with header=0 (Excel row 1 is header) per validation request: header row = 1, first record = row 2
+        # Excluir hojas que ya fueron cargadas previamente
+        def normalize_sheet_name(s: str) -> str:
+            if s is None:
+                return ''
+            return re.sub(r"\s+", "", str(s)).strip().upper()
+
         try:
-            df = pd.read_excel(file_path, sheet_name=sheet_to_use, header=0)
-            logging.getLogger('operations').info(f"Reading disponibilidad sheet '{sheet_to_use}' with header=0 (headers on row 1)")
-        except Exception as read_err:
-            logging.getLogger('operations').error(f"No se pudo leer sheet {sheet_to_use} con header=0: {read_err}")
-            raise
+            loaded_rows = db.execute(text("""
+                SELECT sheet_origen
+                FROM dwh_DisponibilidadTransporte
+                GROUP BY sheet_origen
+            """)).fetchall()
+            loaded_sheets_normalized = {
+                normalize_sheet_name(row[0])
+                for row in loaded_rows
+                if row is not None and row[0] is not None
+            }
+        except Exception as loaded_err:
+            logging.getLogger('operations').warning(
+                f"No se pudo consultar hojas ya cargadas en dwh_DisponibilidadTransporte: {loaded_err}. Se procesarán todas las hojas MMMYY detectadas."
+            )
+            loaded_sheets_normalized = set()
+
+        candidate_sheets = list(sheets_to_process)
+        sheets_to_process = [
+            s for s in candidate_sheets
+            if normalize_sheet_name(s) not in loaded_sheets_normalized
+        ]
+
+        skipped_loaded_sheets = [
+            s for s in candidate_sheets
+            if normalize_sheet_name(s) in loaded_sheets_normalized
+        ]
+
+        if skipped_loaded_sheets:
+            logging.getLogger('operations').info(
+                f"Disponibilidad: se omiten {len(skipped_loaded_sheets)} hoja(s) ya cargadas: {', '.join(skipped_loaded_sheets)}"
+            )
+
+        if not sheets_to_process:
+            raise ValueError("Todas las hojas MMMYY del archivo ya fueron cargadas previamente en dwh_DisponibilidadTransporte")
+
+        logging.getLogger('operations').info(
+            f"Disponibilidad: se procesarán {len(sheets_to_process)} hoja(s): {', '.join(sheets_to_process)}"
+        )
 
         # Helper to normalize strings (used by validation)
         def nk(s: str) -> str:
@@ -1908,61 +1942,88 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
             ss = ''.join(c for c in ss if not unicodedata.combining(c))
             return re.sub(r"\s+", " ", ss).strip().upper()
 
-        # Validate that the header is on Excel row 1 and the first data row is row 2.
-        # Heuristic: if the first data row (df.iloc[0]) contains mostly values equal to the header names
-        # (after normalization), it's likely the file has header on row 2 instead. In that case we raise.
-        try:
-            if df.shape[0] < 1:
-                raise ValueError("El sheet no contiene filas de datos")
-            cols = list(df.columns)
-            # Normalize column names and first data row values
-            normalized_cols = {nk(c) for c in cols}
-            first_row_vals = df.iloc[0]
-            match_count = 0
-            total_checked = 0
-            for c in cols:
-                try:
-                    v = first_row_vals.get(c)
-                except Exception:
-                    v = None
-                if v is None:
-                    # empty cell doesn't count
-                    continue
-                total_checked += 1
-                if isinstance(v, str):
-                    if nk(v) in normalized_cols:
-                        match_count += 1
-                else:
-                    # non-string values are unlikely to be headers
-                    pass
-
-            # If more than half of non-empty first-row cells match header names, suspect header is on row 2
-            if total_checked > 0 and match_count > (len(cols) / 2):
-                raise ValueError("Se esperaba que la fila 1 contenga los encabezados y la fila 2 el primer registro; el archivo parece tener el encabezado en otra fila")
-        except Exception as v_err:
-            logging.getLogger('operations').error(f"Validación de encabezado falló: {v_err}")
-            raise
-
-        df = df.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
-        df = df.where(pd.notnull(df), None)
-
-        # Omitir filas con primer campo vacío
+        all_records = []
+        all_columns = None
         processed_count = 0
-        if df.shape[1] > 0:
-            first_col = df.columns[0]
-            before_count = len(df)
-            try:
-                non_empty_mask = df[first_col].notnull() & (df[first_col].astype(str).str.strip() != '')
-            except Exception:
-                non_empty_mask = df[first_col].notnull()
-            df = df[non_empty_mask]
-            after_count = len(df)
-            dropped = before_count - after_count
-            if dropped > 0:
-                logging.getLogger('operations').info(f"Disponibilidad: omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'")
 
-        records = df.to_dict(orient='records')
+        # Read and validate every MMMYY sheet, then consolidate records
+        with pd.ExcelFile(file_path) as xls:
+            for sheet_to_use in sheets_to_process:
+                # Read with header=0 (Excel row 1 is header) per validation request
+                try:
+                    df_sheet = pd.read_excel(xls, sheet_name=sheet_to_use, header=0)
+                    logging.getLogger('operations').info(
+                        f"Reading disponibilidad sheet '{sheet_to_use}' with header=0 (headers on row 1)"
+                    )
+                except Exception as read_err:
+                    logging.getLogger('operations').error(
+                        f"No se pudo leer sheet {sheet_to_use} con header=0: {read_err}"
+                    )
+                    raise
+
+                # Validate that the header is on Excel row 1 and first data row is row 2
+                try:
+                    if df_sheet.shape[0] < 1:
+                        raise ValueError("El sheet no contiene filas de datos")
+                    cols = list(df_sheet.columns)
+                    normalized_cols = {nk(c) for c in cols}
+                    first_row_vals = df_sheet.iloc[0]
+                    match_count = 0
+                    total_checked = 0
+                    for c in cols:
+                        try:
+                            v = first_row_vals.get(c)
+                        except Exception:
+                            v = None
+                        if v is None:
+                            continue
+                        total_checked += 1
+                        if isinstance(v, str) and nk(v) in normalized_cols:
+                            match_count += 1
+
+                    if total_checked > 0 and match_count > (len(cols) / 2):
+                        raise ValueError(
+                            "Se esperaba que la fila 1 contenga los encabezados y la fila 2 el primer registro; el archivo parece tener el encabezado en otra fila"
+                        )
+                except Exception as v_err:
+                    logging.getLogger('operations').error(
+                        f"Validación de encabezado falló en hoja '{sheet_to_use}': {v_err}"
+                    )
+                    raise
+
+                df_sheet = df_sheet.replace({pd.NA: None, float('nan'): None, float('inf'): None, float('-inf'): None})
+                df_sheet = df_sheet.where(pd.notnull(df_sheet), None)
+
+                # Omitir filas con primer campo vacío
+                if df_sheet.shape[1] > 0:
+                    first_col = df_sheet.columns[0]
+                    before_count = len(df_sheet)
+                    try:
+                        non_empty_mask = df_sheet[first_col].notnull() & (df_sheet[first_col].astype(str).str.strip() != '')
+                    except Exception:
+                        non_empty_mask = df_sheet[first_col].notnull()
+                    df_sheet = df_sheet[non_empty_mask]
+                    after_count = len(df_sheet)
+                    dropped = before_count - after_count
+                    if dropped > 0:
+                        logging.getLogger('operations').info(
+                            f"Disponibilidad hoja '{sheet_to_use}': omitidas {dropped} filas que iniciaban con campo vacío en columna '{first_col}'"
+                        )
+
+                sheet_records = df_sheet.to_dict(orient='records')
+                for rec in sheet_records:
+                    rec['sheet_origen'] = sheet_to_use
+                all_records.extend(sheet_records)
+                if all_columns is None:
+                    all_columns = list(df_sheet.columns) + ['sheet_origen']
+                logging.getLogger('operations').info(
+                    f"Disponibilidad hoja '{sheet_to_use}': procesadas {len(sheet_records)} filas"
+                )
+
+        records = all_records
         processed_count = len(records)
+        df = pd.DataFrame(records) if records else pd.DataFrame(columns=all_columns if all_columns else [])
+        logging.getLogger('operations').info(f"Disponibilidad: total de filas consolidadas {processed_count}")
 
         # Expected logical headers (approximate human names) - we'll do normalization
         expected = [
@@ -1982,8 +2043,8 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
         normalized_key_map = {nk(k): k for k in list(df.columns)}
 
         insert_sql = (
-            "INSERT INTO dbo.disponibilidad_transporte_tmp (Fecha, Capacidad, LT, Origen, Destino, Ruta, Disponibilidad, Ejecutiva, Cliente, Ofertado_Desde, Clasificacion_PQ_No_Cargo, No_Cargo_Por, Incidencias_Ejecutivas, Usuario_Creacion) "
-            "VALUES (:Fecha, :Capacidad, :LT, :Origen, :Destino, :Ruta, :Disponibilidad, :Ejecutiva, :Cliente, :Ofertado_Desde, :Clasificacion_PQ_No_Cargo, :No_Cargo_Por, :Incidencias_Ejecutivas, :Usuario_Creacion)"
+            "INSERT INTO dbo.disponibilidad_transporte_tmp (Fecha, Capacidad, LT, Origen, Destino, Ruta, Disponibilidad, Ejecutiva, Cliente, Ofertado_Desde, Clasificacion_PQ_No_Cargo, No_Cargo_Por, Incidencias_Ejecutivas, sheet_origen, Usuario_Creacion) "
+            "VALUES (:Fecha, :Capacidad, :LT, :Origen, :Destino, :Ruta, :Disponibilidad, :Ejecutiva, :Cliente, :Ofertado_Desde, :Clasificacion_PQ_No_Cargo, :No_Cargo_Por, :Incidencias_Ejecutivas, :sheet_origen, :Usuario_Creacion)"
         )
 
         # Preparar todos los parámetros para BULK INSERT
@@ -1993,6 +2054,7 @@ def process_disponibilidad_transporte(file_path: str, db: object, username: Opti
                 'Fecha': None, 'Capacidad': None, 'LT': None, 'Origen': None, 'Destino': None, 'Ruta': None,
                 'Disponibilidad': None, 'Ejecutiva': None, 'Cliente': None, 'Ofertado_Desde': None,
                 'Clasificacion_PQ_No_Cargo': None, 'No_Cargo_Por': None, 'Incidencias_Ejecutivas': None,
+                'sheet_origen': rec.get('sheet_origen'),
                 'Usuario_Creacion': username
             }
 
