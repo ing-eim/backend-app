@@ -794,6 +794,7 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                 f"{sp2_sql} ejecutado, procesando resultados..."
                             )
                             sp2_resultsets = []
+
                             def _row_to_dict(row_obj, columns: list) -> dict:
                                 if hasattr(row_obj, '_mapping'):
                                     return {str(k): v for k, v in row_obj._mapping.items()}
@@ -801,6 +802,7 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                     return {str(columns[i]): row_obj[i] for i in range(min(len(columns), len(row_obj)))}
                                 except Exception:
                                     return {}
+
                             # Consumir/cerrar todos los resultsets para liberar la conexión.
                             try:
                                 if getattr(sp2_result, 'returns_rows', False):
@@ -811,6 +813,7 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                             sp2_resultsets.append([_row_to_dict(r, first_cols) for r in first_rows])
                                     except Exception:
                                         pass
+
                                 sp2_cursor = getattr(sp2_result, 'cursor', None)
                                 if sp2_cursor is not None:
                                     try:
@@ -831,12 +834,14 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                     sp2_result.close()
                                 except Exception:
                                     pass
+
                             final_sp2_row = None
                             for rs in sp2_resultsets:
                                 for row in rs:
                                     row_upper = {str(k).upper(): v for k, v in row.items()}
                                     if 'STATUS' in row_upper:
                                         final_sp2_row = row_upper
+
                             if final_sp2_row is not None:
                                 ops_logger.info(
                                     f"sp_procesa_ontime_complet resultset final: {final_sp2_row}"
@@ -849,10 +854,12 @@ def process_excel(file_path: str, db: Optional[object] = None, username: Optiona
                                 ops_logger.warning(
                                     "sp_procesa_ontime_complet se ejecutó pero no devolvió un rowset con columna STATUS"
                                 )
+
                             logging.getLogger('operations').info(
                                 f"Procedure sp_procesa_ontime_complet completado exitosamente. "
                                 f"Usuario: {username}, Archivo: {processed_name}"
                             )
+                            
                             # Diagnóstico: estado después del SP2 para los viajes insertados
                             try:
                                 for vid in unique_success_ids if 'unique_success_ids' in locals() else []:
